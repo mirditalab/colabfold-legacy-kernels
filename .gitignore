@@ -1,0 +1,5 @@
+build/
+dist/
+*.egg-info/
+__pycache__/
+src/colabfold_legacy_kernels/kernels/*/*.so

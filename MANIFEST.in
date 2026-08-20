@@ -1,0 +1,3 @@
+recursive-include src/colabfold_legacy_kernels/kernels *.so
+include README.md
+include LICENSE

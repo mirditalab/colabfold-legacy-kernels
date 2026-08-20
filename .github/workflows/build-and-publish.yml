@@ -1,0 +1,105 @@
+name: build-and-publish
+
+on:
+  push:
+    branches: main
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # sm_70 needs CUDA 12 toolkit, thus the build uses a container.
+  # The ubi8 image has glibc 2.28, which gives the manylinux_2_28 tag.
+  CUDA_IMAGE: nvidia/cuda:12.9.1-devel-ubi8
+  CUTLASS_VERSION: "3.5.1"
+  CUTLASS_COMMIT: f7b19de32c5d1f3cedfc735c2849f12b537522ee
+
+jobs:
+  build_linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs_on: ubuntu-latest
+            plat: manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Stage build-time headers
+        run: |
+          pip install --upgrade -q pip build wheel setuptools jax
+          mkdir -p build
+          cp -r "$(python -c 'import jax; print(jax.ffi.include_dir())')" build/ffi-include
+          bash scripts/fetch_cutlass.sh build/cutlass
+
+      - name: Build kernels in CUDA 12
+        run: |
+          docker run --rm -v "$PWD":/io -w /io \
+            -e FFI_INCLUDE=/io/build/ffi-include \
+            -e CUTLASS_DIR=/io/build/cutlass \
+            "$CUDA_IMAGE" bash -euo pipefail -c '
+              # Install the static libstdc++ to make the libraries independent.
+              dnf install -y -q libstdc++-static
+              bash scripts/build_all.sh src/colabfold_legacy_kernels/kernels
+            '
+
+      - name: Audit shared libraries
+        run: |
+          shopt -s globstar
+          for so in src/colabfold_legacy_kernels/kernels/**/*.so; do
+            echo "== $so"
+            ldd "$so"
+            # The libraries must link to the C library only.
+            if ldd "$so" | grep -qE 'libcudart|libstdc\+\+|libgcc_s'; then
+              echo "!! unexpected dynamic dependency in $so" >&2
+              exit 1
+            fi
+          done
+
+      - name: Build wheel
+        run: |
+          python -m build --wheel --no-isolation
+          python -m wheel tags --platform-tag ${{ matrix.plat }} --remove dist/*.whl
+
+      - name: Smoke test
+        run: |
+          pip install dist/*.whl
+          cd /tmp
+          python - <<'PY'
+          import ctypes
+          import colabfold_legacy_kernels as clk
+          for cc in (70, 75):
+              assert clk.available(cc), f"sm_{cc} reports unavailable"
+              for kernel in clk.KERNELS:
+                  if not clk.available(cc, kernel):
+                      continue          # e.g. the CUTLASS attention kernel is sm_75+
+                  path = clk.library_path(kernel, cc)
+                  lib = ctypes.cdll.LoadLibrary(path)
+                  getattr(lib, clk.symbol(kernel, cc))   # FFI symbol must resolve
+                  print(f"sm_{cc} {kernel}: {path}")
+          assert not clk.available(80), "sm_80 must fall back to Pallas"
+          print("smoke test OK")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with: { name: "wheels-linux-${{ matrix.arch }}", path: dist/*.whl }
+
+  publish:
+    needs: [build_linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, pattern: "wheels-*", merge-multiple: true }
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with: { packages-dir: dist }
