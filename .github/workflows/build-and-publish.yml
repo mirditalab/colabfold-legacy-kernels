@@ -34,7 +34,8 @@ jobs:
 
       - name: Stage build-time headers
         run: |
-          pip install --upgrade -q pip build wheel setuptools jax
+          # Oldest supported jax: building on its headers keeps the wheel loadable on newer ones.
+          pip install --upgrade -q pip build wheel setuptools "jax==0.6.2"
           mkdir -p build
           cp -r "$(python -c 'import jax; print(jax.ffi.include_dir())')" build/ffi-include
           bash scripts/fetch_cutlass.sh build/cutlass

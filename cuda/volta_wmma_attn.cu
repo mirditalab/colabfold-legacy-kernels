@@ -48,7 +48,10 @@ template <int D, int BQ, int BK>
 __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     const __half* __restrict__ bias, const uint8_t* __restrict__ kmask, __half* __restrict__ out,
-    int N, int H, int Sq, int Sk, float sm_scale) {
+    int N, int H, int Sq, int Sk, int DR, float sm_scale) {
+    // DR is the real head dim in global memory; D is the shared-memory tile width, which
+    // wmma needs to be a multiple of FRAG. For DR < D the staging zero-fills the rest, so
+    // head 8 needs no padded copy of q/k/v (that copy costs ~2 GB on the extra MSA).
     constexpr int NWARP = BQ / FRAG;
     constexpr int SS_LD = BK + 4; // f32 ldm: multiple of 4 for wmma stores
     constexpr int PS_LD = BK + 8; // f16 ldm: multiple of 8 for wmma loads
@@ -74,8 +77,8 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     float* ms = Os + BQ * D;
     float* ls = ms + BQ;
 
-    const long long qkv = (long long)(n * H + h) * Sq * D;
-    const long long kv = (long long)(n * H + h) * Sk * D;
+    const long long qkv = (long long)(n * H + h) * Sq * DR;
+    const long long kv = (long long)(n * H + h) * Sk * DR;
     const long long bh = (long long)h * Sq * Sk;
 
     // stage Q in the (still unused) S buffer and hoist its fragments
@@ -83,7 +86,7 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     for (int i = tid; i < BQ * D; i += TPB) {
         int r = i / D, c = i - r * D;
         int gq = q0 + r;
-        Qs[i] = (gq < Sq) ? q[qkv + (long long)gq * D + c] : __float2half(0.f);
+        Qs[i] = (gq < Sq && c < DR) ? q[qkv + (long long)gq * DR + c] : __float2half(0.f);
     }
     __syncthreads();
     wmma::fragment<wmma::matrix_a, FRAG, FRAG, FRAG, __half, wmma::row_major> fq[D / FRAG];
@@ -116,9 +119,9 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
             if (i < BK * D) {
                 int r = i / D, c = i - r * D;
                 int gk = k0 + r;
-                bool ok = (gk < Sk);
-                kreg[t] = ok ? k[kv + (long long)gk * D + c] : __float2half(0.f);
-                vreg[t] = ok ? v[kv + (long long)gk * D + c] : __float2half(0.f);
+                bool ok = (gk < Sk) && (c < DR);
+                kreg[t] = ok ? k[kv + (long long)gk * DR + c] : __float2half(0.f);
+                vreg[t] = ok ? v[kv + (long long)gk * DR + c] : __float2half(0.f);
             }
         }
     };
@@ -224,8 +227,8 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
 
     if (gq < Sq) {
         const float inv = 1.0f / fmaxf(ls[r_blk], 1e-30f);
-        for (int c = half_id; c < D; c += 2) {
-            out[qkv + (long long)gq * D + c] = __float2half(Os[r_blk * D + c] * inv);
+        for (int c = half_id; c < DR; c += 2) {
+            out[qkv + (long long)gq * DR + c] = __float2half(Os[r_blk * D + c] * inv);
         }
     }
 }
@@ -233,7 +236,7 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
 template <int D, int BQ, int BK>
 static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const __half* k,
                          const __half* v, const __half* bias, const uint8_t* kmask, __half* out,
-                         int N, int H, int Sq, int Sk, float scale) {
+                         int N, int H, int Sq, int Sk, int DR, float scale) {
     constexpr int SS_LD = BK + 4, PS_LD = BK + 8;
     const size_t smem = (size_t)(BQ * SS_LD) * sizeof(float) +
                         (size_t)(BQ * PS_LD + 2 * BK * D) * sizeof(__half) +
@@ -249,7 +252,8 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     }
     dim3 grid((Sq + BQ - 1) / BQ, H, N);
-    kern<<<grid, BQ / FRAG * WARP, smem, stream>>>(q, k, v, bias, kmask, out, N, H, Sq, Sk, scale);
+    kern<<<grid, BQ / FRAG * WARP, smem, stream>>>(q, k, v, bias, kmask, out, N, H, Sq, Sk, DR,
+                                                  scale);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         return ffi::Error::Internal(std::string("volta_wmma launch: ") + cudaGetErrorString(err));
@@ -274,16 +278,20 @@ ffi::Error VoltaWmmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::D
     const __half* bp = reinterpret_cast<const __half*>(bias.typed_data());
     const uint8_t* mp = kmask.typed_data();
     __half* op = reinterpret_cast<__half*>(out->typed_data());
-#define DISPATCH(DD, BQ, BK)                                                                       \
+#define DISPATCH_T(TILE, DD, BQ, BK)                                                               \
     if (D == (DD) && block_q == (BQ) && block_k == (BK))                                           \
-        return launch<DD, BQ, BK>(stream, device, qp, kp, vp, bp, mp, op, N, H, Sq, Sk, scale);
+        return launch<TILE, BQ, BK>(stream, device, qp, kp, vp, bp, mp, op, N, H, Sq, Sk, (DD),    \
+                                    scale);
+#define DISPATCH(DD, BQ, BK) DISPATCH_T(DD, DD, BQ, BK)
     DISPATCH(32, 64, 64)
     DISPATCH(32, 64, 32)
     DISPATCH(32, 32, 64)
     DISPATCH(32, 32, 32) DISPATCH(32, 128, 64) DISPATCH(32, 128, 32) DISPATCH(16, 64, 64)
         DISPATCH(16, 32, 32) DISPATCH(16, 64, 32) DISPATCH(64, 64, 64) DISPATCH(64, 32, 32)
             DISPATCH(64, 64, 32)
+    DISPATCH_T(16, 8, 64, 64) DISPATCH_T(16, 8, 64, 32) DISPATCH_T(16, 8, 32, 32)
 #undef DISPATCH
+#undef DISPATCH_T
                 return ffi::Error::InvalidArgument("volta_wmma: unsupported (D, bq, bk)");
 }
 

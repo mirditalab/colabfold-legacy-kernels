@@ -50,6 +50,13 @@ if [ ! -f "$FFI_INC/xla/ffi/api/ffi.h" ]; then
   exit 1
 fi
 
+# A handler runs on its own XLA_FFI_API and newer, so newer headers raise the jax floor.
+FFI_API="$(sed -n 's/^#define XLA_FFI_API_\(MAJOR\|MINOR\) *//p' "$FFI_INC/xla/ffi/api/c_api.h" | paste -sd. -)"
+if [ "$FFI_API" != "0.1" ] && [ -z "${ALLOW_NEW_FFI:-}" ]; then
+  echo "!! XLA_FFI_API $FFI_API headers: point \$FFI_INCLUDE at a jax 0.6 wheel, or ALLOW_NEW_FFI=1" >&2
+  exit 1
+fi
+
 CUTLASS="${CUTLASS_DIR:-}"
 if [ -z "$CUTLASS" ]; then
   CUTLASS="$(bash "$repo/scripts/fetch_cutlass.sh" "$work/cutlass")"
@@ -63,7 +70,7 @@ case "$OUT" in /*) dest="$OUT/sm${ARCH}" ;; *) dest="$here/$OUT/sm${ARCH}" ;; es
 mkdir -p "$dest"
 
 echo "nvcc     $NVCC_BIN (CUDA $CUDA_MAJOR)"
-echo "ffi      $FFI_INC"
+echo "ffi      $FFI_INC (api $FFI_API)"
 echo "cutlass  $CUTLASS"
 echo "out      $dest"
 
