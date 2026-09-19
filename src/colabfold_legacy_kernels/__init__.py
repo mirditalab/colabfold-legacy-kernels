@@ -23,6 +23,10 @@ _TABLE = {
         (75, "libvolta_mma.so", "VoltaMma"),
         (70, "libvolta_wmma.so", "VoltaWmma"),
     ),
+    "attention_bwd": (
+        (75, "libvolta_mma_bwd.so", "VoltaMmaBwd"),
+        (70, "libvolta_wmma_bwd.so", "VoltaWmmaBwd"),
+    ),
     "layer_norm": (
         (70, "libvolta_ops.so", "VoltaLayerNorm"),
     ),
