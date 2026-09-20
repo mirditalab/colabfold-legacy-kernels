@@ -26,9 +26,9 @@ _TABLE = {
     "layer_norm": (
         (70, "libvolta_ops.so", "VoltaLayerNorm"),
     ),
-    # sm_75 only: the wmma (sm_70) attention has no backward yet.
     "attention_bwd": (
         (75, "libvolta_mma_bwd.so", "VoltaMmaBwd"),
+        (70, "libvolta_wmma_bwd.so", "VoltaWmmaBwd"),
     ),
     "gated_dual_proj": (
         (75, "libvolta_ops.so", "VoltaGdp"),
