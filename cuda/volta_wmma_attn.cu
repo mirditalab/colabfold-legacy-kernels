@@ -48,7 +48,7 @@ template <int D, int BQ, int BK>
 __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     const __half* __restrict__ bias, const uint8_t* __restrict__ kmask, __half* __restrict__ out,
-    int N, int H, int Sq, int Sk, int DR, float sm_scale) {
+    float* __restrict__ lse, int N, int H, int Sq, int Sk, int DR, float sm_scale) {
     // DR is the real head dim in global memory; D is the shared-memory tile width, which
     // wmma needs to be a multiple of FRAG. For DR < D the staging zero-fills the rest, so
     // head 8 needs no padded copy of q/k/v (that copy costs ~2 GB on the extra MSA).
@@ -226,6 +226,12 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     }
 
     if (gq < Sq) {
+        // softmax statistic, for the backward pass. Both lanes of a row hold
+        // the same reduced m/l, so only one of them writes.
+        if (lse != nullptr && half_id == 0) {
+            const float l = ls[r_blk];
+            lse[(long long)(n * H + h) * Sq + gq] = (l > 0.f) ? (ms[r_blk] + log2f(l)) : -INFINITY;
+        }
         const float inv = 1.0f / fmaxf(ls[r_blk], 1e-30f);
         for (int c = half_id; c < DR; c += 2) {
             out[qkv + (long long)gq * DR + c] = __float2half(Os[r_blk * D + c] * inv);
@@ -236,7 +242,7 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
 template <int D, int BQ, int BK>
 static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const __half* k,
                          const __half* v, const __half* bias, const uint8_t* kmask, __half* out,
-                         int N, int H, int Sq, int Sk, int DR, float scale) {
+                         float* lse, int N, int H, int Sq, int Sk, int DR, float scale) {
     constexpr int SS_LD = BK + 4, PS_LD = BK + 8;
     const size_t smem = (size_t)(BQ * SS_LD) * sizeof(float) +
                         (size_t)(BQ * PS_LD + 2 * BK * D) * sizeof(__half) +
@@ -252,8 +258,8 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     }
     dim3 grid((Sq + BQ - 1) / BQ, H, N);
-    kern<<<grid, BQ / FRAG * WARP, smem, stream>>>(q, k, v, bias, kmask, out, N, H, Sq, Sk, DR,
-                                                  scale);
+    kern<<<grid, BQ / FRAG * WARP, smem, stream>>>(q, k, v, bias, kmask, out, lse, N, H, Sq, Sk,
+                                                  DR, scale);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         return ffi::Error::Internal(std::string("volta_wmma launch: ") + cudaGetErrorString(err));
@@ -261,11 +267,14 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
     return ffi::Error::Success();
 }
 
-ffi::Error VoltaWmmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
-                         ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
-                         ffi::Buffer<ffi::DataType::F16> bias, ffi::Buffer<ffi::DataType::U8> kmask,
-                         ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, float scale,
-                         int64_t block_q, int64_t block_k) {
+static ffi::Error volta_wmma_common(cudaStream_t stream, int32_t device,
+                                    ffi::Buffer<ffi::DataType::F16> q,
+                                    ffi::Buffer<ffi::DataType::F16> k,
+                                    ffi::Buffer<ffi::DataType::F16> v,
+                                    ffi::Buffer<ffi::DataType::F16> bias,
+                                    ffi::Buffer<ffi::DataType::U8> kmask,
+                                    ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, float* lse,
+                                    float scale, int64_t block_q, int64_t block_k) {
     auto d = q.dimensions();
     if (d.size() != 4) {
         return ffi::Error::InvalidArgument("q must be [N,H,S,D]");
@@ -280,8 +289,8 @@ ffi::Error VoltaWmmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::D
     __half* op = reinterpret_cast<__half*>(out->typed_data());
 #define DISPATCH_T(TILE, DD, BQ, BK)                                                               \
     if (D == (DD) && block_q == (BQ) && block_k == (BK))                                           \
-        return launch<TILE, BQ, BK>(stream, device, qp, kp, vp, bp, mp, op, N, H, Sq, Sk, (DD),    \
-                                    scale);
+        return launch<TILE, BQ, BK>(stream, device, qp, kp, vp, bp, mp, op, lse, N, H, Sq, Sk,    \
+                                    (DD), scale);
 #define DISPATCH(DD, BQ, BK) DISPATCH_T(DD, DD, BQ, BK)
     DISPATCH(32, 64, 64)
     DISPATCH(32, 64, 32)
@@ -295,6 +304,29 @@ ffi::Error VoltaWmmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::D
                 return ffi::Error::InvalidArgument("volta_wmma: unsupported (D, bq, bk)");
 }
 
+ffi::Error VoltaWmmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
+                         ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
+                         ffi::Buffer<ffi::DataType::F16> bias, ffi::Buffer<ffi::DataType::U8> kmask,
+                         ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, float scale,
+                         int64_t block_q, int64_t block_k) {
+    return volta_wmma_common(stream, device, q, k, v, bias, kmask, out, nullptr, scale, block_q,
+                             block_k);
+}
+
+// Same kernel, one more result: the softmax statistic the backward needs.
+// A separate symbol rather than a second Ret on VoltaWmma, so a wheel with
+// this in it still drives every caller written against the original ABI.
+ffi::Error VoltaWmmaFwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
+                            ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
+                            ffi::Buffer<ffi::DataType::F16> bias,
+                            ffi::Buffer<ffi::DataType::U8> kmask,
+                            ffi::Result<ffi::Buffer<ffi::DataType::F16>> out,
+                            ffi::Result<ffi::Buffer<ffi::DataType::F32>> lse, float scale,
+                            int64_t block_q, int64_t block_k) {
+    return volta_wmma_common(stream, device, q, k, v, bias, kmask, out, lse->typed_data(), scale,
+                             block_q, block_k);
+}
+
 XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmma, VoltaWmmaImpl,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>()
@@ -305,6 +337,22 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmma, VoltaWmmaImpl,
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::U8>>()
                                   .Ret<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Attr<float>("scale")
+                                  .Attr<int64_t>("block_q")
+                                  .Attr<int64_t>("block_k"),
+                              {ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmmaFwd, VoltaWmmaFwdImpl,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Ctx<ffi::DeviceOrdinal>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::U8>>()
+                                  .Ret<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Ret<ffi::Buffer<ffi::DataType::F32>>()
                                   .Attr<float>("scale")
                                   .Attr<int64_t>("block_q")
                                   .Attr<int64_t>("block_k"),

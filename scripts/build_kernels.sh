@@ -99,6 +99,7 @@ run_nvcc() {
 # VoltaLayerNorm uses no tensor cores, thus libvolta_ops.so needs none below sm_75.
 UNITS="
 libvolta_wmma.so:volta_wmma_attn.cu:70:70
+libvolta_wmma_bwd.so:volta_wmma_attn_bwd.cu:70:70
 libvolta_gdp_wmma.so:volta_gdp_wmma.cu:70:70
 libvolta_ops.so:volta_ops.cu:70:75
 libvolta_mma.so:volta_mma_attn.cu:75:75

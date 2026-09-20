@@ -1,10 +1,11 @@
-"""VoltaMmaFwd / VoltaMmaBwd against JAX's own autodiff.
+"""VoltaMmaFwd / VoltaMmaBwd against JAX's own autodiff, and the wmma pair.
 
-  KERNEL_DIR=<dir with libvolta_mma*.so> python tests/test_attn_bwd.py
+  KERNEL_DIR=<dir with libvolta_*.so> python tests/test_attn_bwd.py [mma|wmma]
 
-The kernels are sm_75+, so this runs on any Turing-or-newer card once the
-libraries are built for it -- which is how it can be developed on an Ampere
-box and only confirmed on the T4 it is meant for.
+Neither family needs the card it targets: the mma kernels run on any
+Turing-or-newer card and the wmma ones on anything from Volta up, so both can
+be developed on an Ampere box and only confirmed on the T4 or V100 they are
+meant for.
 """
 import ctypes
 import os
@@ -18,9 +19,14 @@ KERNEL_DIR = os.environ.get('KERNEL_DIR', '.')
 NEG = -1.0e4
 
 
+FAMILY = 'mma'   # or 'wmma', set from argv
+
+
 def register():
-  for lib, syms in (('libvolta_mma.so', ('VoltaMma', 'VoltaMmaFwd')),
-                    ('libvolta_mma_bwd.so', ('VoltaMmaBwd',))):
+  tag = 'mma' if FAMILY == 'mma' else 'wmma'
+  name = 'Mma' if FAMILY == 'mma' else 'Wmma'
+  for lib, syms in ((f'libvolta_{tag}.so', (f'Volta{name}', f'Volta{name}Fwd')),
+                    (f'libvolta_{tag}_bwd.so', (f'Volta{name}Bwd',))):
     handle = ctypes.cdll.LoadLibrary(os.path.join(KERNEL_DIR, lib))
     for sym in syms:
       jax.ffi.register_ffi_target(
@@ -31,7 +37,7 @@ def fwd(q, k, v, bias, kmask, scale, bq=64, bk=32):
   n, h, sq, d = q.shape
   sk = k.shape[2]
   return jax.ffi.ffi_call(
-      'VoltaMmaFwd',
+      'VoltaMmaFwd' if FAMILY == 'mma' else 'VoltaWmmaFwd',
       (jax.ShapeDtypeStruct((n, h, sq, d), jnp.float16),
        jax.ShapeDtypeStruct((n, h, sq), jnp.float32)),
       vmap_method='sequential')(
@@ -43,7 +49,7 @@ def bwd(q, k, v, bias, kmask, dout, lse, delta, scale, bq=64, bk=32):
   n, h, sq, d = q.shape
   sk = k.shape[2]
   return jax.ffi.ffi_call(
-      'VoltaMmaBwd',
+      'VoltaMmaBwd' if FAMILY == 'mma' else 'VoltaWmmaBwd',
       (jax.ShapeDtypeStruct(q.shape, jnp.float16),
        jax.ShapeDtypeStruct(k.shape, jnp.float16),
        jax.ShapeDtypeStruct(v.shape, jnp.float16),
@@ -104,11 +110,15 @@ def run(n=3, h=4, sq=96, sk=96, d=32, seed=0, bq=64, bk=32):
 
 
 if __name__ == '__main__':
+  if len(sys.argv) > 1:
+    FAMILY = sys.argv[1]
+    assert FAMILY in ('mma', 'wmma')
+  print('family:', FAMILY)
   register()
   bad = 0
   for kwargs in (dict(sq=96, sk=96, d=32),
                  dict(sq=96, sk=96, d=32, bq=64, bk=64),
-                 dict(sq=64, sk=64, d=64, bk=64),   # the mma forward has no (64, 64, 32)
+                 dict(sq=64, sk=64, d=64, bk=64),   # neither forward has (64, 64, 32)
                  dict(sq=70, sk=83, d=16),        # ragged, both axes
                  dict(sq=128, sk=32, d=8, n=1, h=1)):
     print(kwargs)
