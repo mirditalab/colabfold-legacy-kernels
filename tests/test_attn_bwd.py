@@ -79,6 +79,28 @@ def reference(q, k, v, bias, kmask, scale):
   return jnp.einsum('nhqk,nhkd->nhqd', p, v)
 
 
+def reference_grads(q, k, v, bias, kmask, dout, scale):
+  """The same attention and its gradients in float64 numpy. Closed form, so a
+  sweep over shapes costs no XLA compile; vjp_case keeps the autodiff check."""
+  q, k, v = (np.asarray(x, np.float64) for x in (q, k, v))
+  bias, dout = np.asarray(bias, np.float64), np.asarray(dout, np.float64)
+  m = np.asarray(kmask)[:, None, None, :] != 0
+  logits = np.where(m, scale * np.einsum('nhqd,nhkd->nhqk', q, k) + bias[None], NEG)
+  mx = logits.max(-1, keepdims=True)
+  e = np.exp(logits - mx)
+  l = e.sum(-1, keepdims=True)
+  p = e / l
+  out = np.einsum('nhqk,nhkd->nhqd', p, v)
+  lse2 = ((np.log(l) + mx)[..., 0]) * 1.4426950408889634
+  dv = np.einsum('nhqk,nhqd->nhkd', p, dout)
+  dp = np.einsum('nhqd,nhkd->nhqk', dout, v)
+  ds = p * (dp - (p * dp).sum(-1, keepdims=True))
+  ds = np.where(m, ds, 0.0)          # a masked logit is a constant
+  dq = np.einsum('nhqk,nhkd->nhqd', ds, k) * scale
+  dk = np.einsum('nhqk,nhqd->nhkd', ds, q) * scale
+  return out, lse2, dq, dk, dv, ds.sum(0)
+
+
 def rel(a, b):
   a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
   if not np.isfinite(a).all():
@@ -90,15 +112,23 @@ def rel(a, b):
 
 
 def inputs(n, h, sq, sk, d, seed, masked_rows=0.15, qk_amp=0.5, vo_amp=0.5):
-  ks = jax.random.split(jax.random.PRNGKey(seed), 6)
-  f16 = lambda x: x.astype(jnp.float16)
-  q = f16(jax.random.normal(ks[0], (n, h, sq, d)) * qk_amp)
-  k = f16(jax.random.normal(ks[1], (n, h, sk, d)) * qk_amp)
-  v = f16(jax.random.normal(ks[2], (n, h, sk, d)) * vo_amp)
-  bias = f16(jax.random.normal(ks[3], (h, sq, sk)) * qk_amp)
-  kmask = (jax.random.uniform(ks[4], (n, sk)) > masked_rows).astype(jnp.uint8)
-  dout = f16(jax.random.normal(ks[5], (n, h, sq, d)) * vo_amp)
+  # numpy, not jax.random: every distinct shape would otherwise cost an XLA
+  # compile, which dominates a sweep over shapes.
+  rng = np.random.default_rng(seed)
+  f16 = lambda x: jnp.asarray(x, jnp.float16)
+  q = f16(rng.standard_normal((n, h, sq, d)) * qk_amp)
+  k = f16(rng.standard_normal((n, h, sk, d)) * qk_amp)
+  v = f16(rng.standard_normal((n, h, sk, d)) * vo_amp)
+  bias = f16(rng.standard_normal((h, sq, sk)) * qk_amp)
+  kmask = jnp.asarray(rng.random((n, sk)) > masked_rows, jnp.uint8)
+  dout = f16(rng.standard_normal((n, h, sq, d)) * vo_amp)
   return q, k, v, bias, kmask, dout
+
+
+def row_delta(out, dout):
+  """The row statistic the backward takes, on the host for the same reason."""
+  return jnp.asarray(
+      (np.asarray(out, np.float32) * np.asarray(dout, np.float32)).sum(-1))
 
 
 def run(n=3, h=4, sq=96, sk=96, d=32, seed=0, bq=64, bk=32, kmask=None,
@@ -109,19 +139,12 @@ def run(n=3, h=4, sq=96, sk=96, d=32, seed=0, bq=64, bk=32, kmask=None,
     km = kmask
   scale = float(d) ** -0.5
 
-  qf, kf, vf, bf = [x.astype(jnp.float32) for x in (q, k, v, bias)]
-  ref_out, vjp = jax.vjp(
-      lambda a, b, c, e: reference(a, b, c, e, km, scale), qf, kf, vf, bf)
-  ref_dq, ref_dk, ref_dv, ref_dbias = vjp(dout.astype(jnp.float32))
+  # lse comes back in the log2 domain, which is what the kernel's exp2 wants.
+  ref_out, ref_lse2, ref_dq, ref_dk, ref_dv, ref_dbias = reference_grads(
+      q, k, v, bias, km, dout, scale)
 
   out, lse = fwd(q, k, v, bias, km, scale, bq, bk)
-  delta = jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32), -1)
-  dq, dk, dv, dbias = bwd(q, k, v, bias, km, dout, lse, delta, scale)
-
-  # lse comes back in the log2 domain, which is what the kernel's exp2 wants.
-  ref_logits = scale * jnp.einsum('nhqd,nhkd->nhqk', qf, kf) + bf[None]
-  ref_logits = jnp.where(km[:, None, None, :] != 0, ref_logits, NEG)
-  ref_lse2 = jax.scipy.special.logsumexp(ref_logits, -1) * 1.4426950408889634
+  dq, dk, dv, dbias = bwd(q, k, v, bias, km, dout, lse, row_delta(out, dout), scale)
 
   rows = [('out', out, ref_out), ('lse2', lse, ref_lse2), ('dq', dq, ref_dq),
           ('dk', dk, ref_dk), ('dv', dv, ref_dv), ('dbias', dbias, ref_dbias)]
@@ -226,7 +249,7 @@ def repeat_case():
   q, k, v, bias, km, dout = inputs(3, 4, 96, 96, 32, 0)
   scale = 32.0 ** -0.5
   out, lse = fwd(q, k, v, bias, km, scale)
-  delta = jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32), -1)
+  delta = row_delta(out, dout)
   a = bwd(q, k, v, bias, km, dout, lse, delta, scale)
   b = bwd(q, k, v, bias, km, dout, lse, delta, scale)
   bad = 0
@@ -283,7 +306,7 @@ def want_flags_case():
   scale = 32.0 ** -0.5
   out, lse = fwd(q, k, v, bias, km, scale)
   out_off, _ = fwd(q, k, v, bias, km, scale, want_lse=False)
-  delta = jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32), -1)
+  delta = row_delta(out, dout)
   grads = bwd(q, k, v, bias, km, dout, lse, delta, scale)
   off = bwd(q, k, v, bias, km, dout, lse, delta, scale, want_dbias=False)
   bad = 0
