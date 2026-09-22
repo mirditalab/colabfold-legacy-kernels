@@ -53,7 +53,8 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     // wmma needs to be a multiple of FRAG. For DR < D the staging zero-fills the rest, so
     // head 8 needs no padded copy of q/k/v (that copy costs ~2 GB on the extra MSA).
     constexpr int NWARP = BQ / FRAG;
-    constexpr int SS_LD = BK + 4; // f32 ldm: multiple of 4 for wmma stores
+    // The O tile comes back through this buffer too, thus D columns, not BK.
+    constexpr int SS_LD = (BK > D ? BK : D) + 4; // f32 ldm: multiple of 4 for wmma stores
     constexpr int PS_LD = BK + 8; // f16 ldm: multiple of 8 for wmma loads
     constexpr int TPB = NWARP * WARP;
     constexpr int KV_PER_THREAD = (BK * D + TPB - 1) / TPB;
@@ -243,7 +244,7 @@ template <int D, int BQ, int BK>
 static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const __half* k,
                          const __half* v, const __half* bias, const uint8_t* kmask, __half* out,
                          float* lse, int N, int H, int Sq, int Sk, int DR, float scale) {
-    constexpr int SS_LD = BK + 4, PS_LD = BK + 8;
+    constexpr int SS_LD = (BK > D ? BK : D) + 4, PS_LD = BK + 8;
     const size_t smem = (size_t)(BQ * SS_LD) * sizeof(float) +
                         (size_t)(BQ * PS_LD + 2 * BK * D) * sizeof(__half) +
                         (size_t)(BQ * D + 2 * BQ) * sizeof(float);
