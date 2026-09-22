@@ -57,7 +57,7 @@ def fwd(q, k, v, bias, kmask, scale, bq=64, bk=32, want_lse=True):
           block_q=np.int64(bq), block_k=np.int64(bk), want_lse=want_lse)
 
 
-def bwd(q, k, v, bias, kmask, dout, lse, delta, scale, want_dbias=True):
+def bwd(q, k, v, bias, kmask, out, dout, lse, scale, want_dbias=True):
   n, h, sq, d = q.shape
   sk = k.shape[2]
   return jax.ffi.ffi_call(
@@ -67,7 +67,7 @@ def bwd(q, k, v, bias, kmask, dout, lse, delta, scale, want_dbias=True):
        jax.ShapeDtypeStruct(v.shape, jnp.float16),
        jax.ShapeDtypeStruct((h, sq, sk), jnp.float32)),
       vmap_method='sequential')(
-          q, k, v, bias, kmask, dout, lse, delta, scale=np.float32(scale),
+          q, k, v, bias, kmask, out, dout, lse, scale=np.float32(scale),
           want_dbias=want_dbias)
 
 
@@ -125,12 +125,6 @@ def inputs(n, h, sq, sk, d, seed, masked_rows=0.15, qk_amp=0.5, vo_amp=0.5):
   return q, k, v, bias, kmask, dout
 
 
-def row_delta(out, dout):
-  """The row statistic the backward takes, on the host for the same reason."""
-  return jnp.asarray(
-      (np.asarray(out, np.float32) * np.asarray(dout, np.float32)).sum(-1))
-
-
 def run(n=3, h=4, sq=96, sk=96, d=32, seed=0, bq=64, bk=32, kmask=None,
         quiet=False, qk_amp=0.5, vo_amp=0.5):
   q, k, v, bias, km, dout = inputs(n, h, sq, sk, d, seed, qk_amp=qk_amp,
@@ -144,7 +138,7 @@ def run(n=3, h=4, sq=96, sk=96, d=32, seed=0, bq=64, bk=32, kmask=None,
       q, k, v, bias, km, dout, scale)
 
   out, lse = fwd(q, k, v, bias, km, scale, bq, bk)
-  dq, dk, dv, dbias = bwd(q, k, v, bias, km, dout, lse, row_delta(out, dout), scale)
+  dq, dk, dv, dbias = bwd(q, k, v, bias, km, out, dout, lse, scale)
 
   rows = [('out', out, ref_out), ('lse2', lse, ref_lse2), ('dq', dq, ref_dq),
           ('dk', dk, ref_dk), ('dv', dv, ref_dv), ('dbias', dbias, ref_dbias)]
@@ -250,9 +244,8 @@ def repeat_case():
   q, k, v, bias, km, dout = inputs(3, 4, 96, 96, 32, 0)
   scale = 32.0 ** -0.5
   out, lse = fwd(q, k, v, bias, km, scale)
-  delta = row_delta(out, dout)
-  a = bwd(q, k, v, bias, km, dout, lse, delta, scale)
-  b = bwd(q, k, v, bias, km, dout, lse, delta, scale)
+  a = bwd(q, k, v, bias, km, out, dout, lse, scale)
+  b = bwd(q, k, v, bias, km, out, dout, lse, scale)
   bad = 0
   for name, x, y in zip(('dk', 'dv'), a[1:3], b[1:3]):
     if not np.array_equal(np.asarray(x), np.asarray(y)):
@@ -282,8 +275,7 @@ def vjp_case():
 
   def fused_bwd(res, dout):
     q, k, v, bias, out, lse = res
-    delta = jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32), -1)
-    dq, dk, dv, dbias = bwd(q, k, v, bias, km, dout, lse, delta, scale)
+    dq, dk, dv, dbias = bwd(q, k, v, bias, km, out, dout, lse, scale)
     return dq, dk, dv, dbias.astype(bias.dtype)
 
   fused.defvjp(fused_fwd, fused_bwd)
@@ -322,7 +314,7 @@ def xla_case():
 
     # 32x32 is the one forward tiling every head dim has
     out, lse = fwd(q, k, v, bias, km, scale, 32, 32)
-    ours = (out,) + bwd(q, k, v, bias, km, dout, lse, row_delta(out, dout), scale)
+    ours = (out,) + bwd(q, k, v, bias, km, out, dout, lse, scale)
     names = ('out', 'dq', 'dk', 'dv', 'dbias')
     want = (truth[0],) + truth[2:]
     print(f'    n={n} h={h} sq={sq} sk={sk} D={d}')
@@ -356,9 +348,8 @@ def want_flags_case():
   scale = 32.0 ** -0.5
   out, lse = fwd(q, k, v, bias, km, scale)
   out_off, _ = fwd(q, k, v, bias, km, scale, want_lse=False)
-  delta = row_delta(out, dout)
-  grads = bwd(q, k, v, bias, km, dout, lse, delta, scale)
-  off = bwd(q, k, v, bias, km, dout, lse, delta, scale, want_dbias=False)
+  grads = bwd(q, k, v, bias, km, out, dout, lse, scale)
+  off = bwd(q, k, v, bias, km, out, dout, lse, scale, want_dbias=False)
   bad = 0
   if not np.array_equal(np.asarray(out), np.asarray(out_off)):
     print('  out changed when want_lse was off')
