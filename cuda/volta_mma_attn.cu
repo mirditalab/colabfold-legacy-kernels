@@ -350,6 +350,9 @@ static ffi::Error volta_mma_common(cudaStream_t stream, int32_t device,
         DISPATCH(32, 32, 64) DISPATCH(32, 32, 32) DISPATCH(32, 128, 64) DISPATCH(32, 16, 64)
             DISPATCH(16, 64, 64) DISPATCH(16, 32, 32) DISPATCH(16, 64, 32) DISPATCH(64, 64, 64)
                 DISPATCH(64, 32, 32)
+    // af3 head dims: single 384/16, diffusion token 768/16, protenix2's 96
+    DISPATCH(24, 64, 32) DISPATCH(24, 32, 32) DISPATCH(48, 64, 32) DISPATCH(48, 32, 32)
+        DISPATCH(96, 64, 32) DISPATCH(96, 32, 32)
 #undef DISPATCH
                     return ffi::Error::InvalidArgument("volta_mma: unsupported (D, bq, bk)");
 }

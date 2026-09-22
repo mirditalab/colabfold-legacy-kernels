@@ -511,6 +511,9 @@ ffi::Error VoltaMmaBwdImpl(cudaStream_t stream, int32_t device, ffi::ScratchAllo
     DISPATCH_BWD(16)
     DISPATCH_BWD(32)
     DISPATCH_BWD(64)
+    DISPATCH_BWD(24)
+    DISPATCH_BWD(48)
+    DISPATCH_BWD(96)
 #undef DISPATCH_BWD
     return ffi::Error::InvalidArgument("volta_mma_bwd: unsupported head dim");
 }

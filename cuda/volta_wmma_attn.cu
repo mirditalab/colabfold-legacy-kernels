@@ -303,6 +303,9 @@ static ffi::Error volta_wmma_common(cudaStream_t stream, int32_t device,
         DISPATCH(16, 32, 32) DISPATCH(16, 64, 32) DISPATCH(64, 64, 64) DISPATCH(64, 32, 32)
             DISPATCH(64, 64, 32)
     DISPATCH_T(16, 8, 64, 64) DISPATCH_T(16, 8, 64, 32) DISPATCH_T(16, 8, 32, 32)
+    // af3 head dims: diffusion token 768/16, protenix2's 96. 24 is not a
+    // multiple of FRAG, so it keeps padding to 32.
+    DISPATCH(48, 64, 32) DISPATCH(48, 32, 32) DISPATCH(96, 64, 32) DISPATCH(96, 32, 32)
 #undef DISPATCH
 #undef DISPATCH_T
                 return ffi::Error::InvalidArgument("volta_wmma: unsupported (D, bq, bk)");
