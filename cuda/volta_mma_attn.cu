@@ -355,47 +355,23 @@ static ffi::Error volta_mma_common(cudaStream_t stream, int32_t device,
                     return ffi::Error::InvalidArgument("volta_mma: unsupported (D, bq, bk)");
 }
 
+// lse is the softmax statistic the backward needs. A caller that only infers
+// passes want_lse false, and the store compiles out of the kernel it picks.
 ffi::Error VoltaMmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
                         ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
                         ffi::Buffer<ffi::DataType::F16> bias, ffi::Buffer<ffi::DataType::U8> kmask,
-                        ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, float scale,
-                        int64_t block_q, int64_t block_k) {
+                        ffi::Result<ffi::Buffer<ffi::DataType::F16>> out,
+                        ffi::Result<ffi::Buffer<ffi::DataType::F32>> lse, float scale,
+                        int64_t block_q, int64_t block_k, bool want_lse) {
+    if (want_lse) {
+        return volta_mma_common<true>(stream, device, q, k, v, bias, kmask, out,
+                                      lse->typed_data(), scale, block_q, block_k);
+    }
     return volta_mma_common<false>(stream, device, q, k, v, bias, kmask, out, nullptr, scale,
                                    block_q, block_k);
 }
 
-// Same kernel, one more result: the softmax statistic the backward needs.
-// A separate symbol rather than a second Ret on VoltaMma, so a wheel with this
-// in it still drives every caller written against the original ABI.
-ffi::Error VoltaMmaFwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
-                           ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
-                           ffi::Buffer<ffi::DataType::F16> bias,
-                           ffi::Buffer<ffi::DataType::U8> kmask,
-                           ffi::Result<ffi::Buffer<ffi::DataType::F16>> out,
-                           ffi::Result<ffi::Buffer<ffi::DataType::F32>> lse, float scale,
-                           int64_t block_q, int64_t block_k) {
-    return volta_mma_common<true>(stream, device, q, k, v, bias, kmask, out, lse->typed_data(),
-                                  scale, block_q, block_k);
-}
-
-// kCmdBufferCompatible lets XLA put this call in a CUDA graph.
-// This is correct because the handler only starts one kernel on the XLA stream.
 XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaMma, VoltaMmaImpl,
-                              ffi::Ffi::Bind()
-                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
-                                  .Ctx<ffi::DeviceOrdinal>()
-                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Arg<ffi::Buffer<ffi::DataType::U8>>()
-                                  .Ret<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Attr<float>("scale")
-                                  .Attr<int64_t>("block_q")
-                                  .Attr<int64_t>("block_k"),
-                              {ffi::Traits::kCmdBufferCompatible});
-
-XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaMmaFwd, VoltaMmaFwdImpl,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>()
                                   .Ctx<ffi::DeviceOrdinal>()
@@ -408,5 +384,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaMmaFwd, VoltaMmaFwdImpl,
                                   .Ret<ffi::Buffer<ffi::DataType::F32>>()
                                   .Attr<float>("scale")
                                   .Attr<int64_t>("block_q")
-                                  .Attr<int64_t>("block_k"),
+                                  .Attr<int64_t>("block_k")
+                                  .Attr<bool>("want_lse"),
                               {ffi::Traits::kCmdBufferCompatible});
