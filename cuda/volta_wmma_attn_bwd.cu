@@ -429,8 +429,8 @@ ffi::Error VoltaWmmaBwdImpl(cudaStream_t stream, int32_t device, ffi::ScratchAll
     float* dbp = reinterpret_cast<float*>(dbias->typed_data());
 
     // The backward holds four tiles where the forward holds two, thus a tiling
-    // of its own rather than the forward's: 32x32 measures best, except at head
-    // 64 where a 64-row query tile is a third faster. 63 KB at most.
+    // of its own rather than the forward's. 32x32 measures best on a V100, which
+    // is the only card this unit is built for.
 #define DISPATCH_BWD_T(TILE, DD, BQ)                                                               \
     if (D == (DD))                                                                                 \
         return want_dbias                                                                          \
@@ -444,7 +444,7 @@ ffi::Error VoltaWmmaBwdImpl(cudaStream_t stream, int32_t device, ffi::ScratchAll
     DISPATCH_BWD_T(16, 8, 32)
     DISPATCH_BWD_T(16, 16, 32)
     DISPATCH_BWD_T(32, 32, 32)
-    DISPATCH_BWD_T(64, 64, 64)
+    DISPATCH_BWD_T(64, 64, 32)
 #undef DISPATCH_BWD_T
     return ffi::Error::InvalidArgument("volta_wmma_bwd: unsupported head dim");
 }
