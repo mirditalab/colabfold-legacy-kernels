@@ -45,10 +45,12 @@ def register():
 
 def fwd(q, k, v, bias, kmask, scale, bq=64, bk=32, want_lse=True):
   n, h, sq, d = q.shape
+  # an inference caller asks for a dummy lse, which the kernel never writes
+  lse_shape = (n, h, sq) if want_lse else (1,)
   return jax.ffi.ffi_call(
       'VoltaMma' if FAMILY == 'mma' else 'VoltaWmma',
       (jax.ShapeDtypeStruct((n, h, sq, d), jnp.float16),
-       jax.ShapeDtypeStruct((n, h, sq), jnp.float32)),
+       jax.ShapeDtypeStruct(lse_shape, jnp.float32)),
       vmap_method='sequential')(
           q, k, v, bias, kmask, scale=np.float32(scale),
           block_q=np.int64(bq), block_k=np.int64(bk), want_lse=want_lse)

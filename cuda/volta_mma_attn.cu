@@ -356,7 +356,8 @@ static ffi::Error volta_mma_common(cudaStream_t stream, int32_t device,
 }
 
 // lse is the softmax statistic the backward needs. A caller that only infers
-// passes want_lse false, and the store compiles out of the kernel it picks.
+// passes want_lse false: the store compiles out of the kernel it picks, and the
+// buffer is never touched, so hand in a one-element dummy rather than [N,H,Sq].
 ffi::Error VoltaMmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
                         ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
                         ffi::Buffer<ffi::DataType::F16> bias, ffi::Buffer<ffi::DataType::U8> kmask,
