@@ -1,5 +1,5 @@
 // Gated dual projection for Volta (sm_70+), with nvcuda::wmma.
-// It calculates mask * (x@wp + bp) * sigmoid(x@wg + bg) in one kernel.
+// It calculates mask * (x@wp + bp) * act(x@wg + bg) in one kernel.
 
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -7,13 +7,15 @@
 #include <string>
 #include "xla/ffi/api/ffi.h"
 
+#include "volta_gdp.h"
+
 namespace ffi = xla::ffi;
 using namespace nvcuda;
 
 #define WARP 32
 #define FRAG 16
 
-template <int BM, int BN, int BK>
+template <int BM, int BN, int BK, GdpAct A>
 __global__ __launch_bounds__(BM / FRAG * WARP, 2) void volta_gdp_wmma_kernel(
     const __half* __restrict__ x, const __half* __restrict__ wp, const __half* __restrict__ bp,
     const __half* __restrict__ wg, const __half* __restrict__ bg, const __half* __restrict__ mask,
@@ -89,7 +91,7 @@ __global__ __launch_bounds__(BM / FRAG * WARP, 2) void volta_gdp_wmma_kernel(
             }
             const float p = ep[i] + __half2float(bp[gn]);
             const float g = eg[i] + __half2float(bg[gn]);
-            const float s = 1.0f / (1.0f + __expf(-g));
+            const float s = gdp_act<A>(g);
             out[(long long)gm * N + gn] = __float2half(__half2float(mask[gm]) * p * s);
         }
         __syncwarp();
@@ -100,7 +102,7 @@ ffi::Error GdpWmmaImpl(cudaStream_t stream, ffi::Buffer<ffi::DataType::F16> x,
                        ffi::Buffer<ffi::DataType::F16> wp, ffi::Buffer<ffi::DataType::F16> bp,
                        ffi::Buffer<ffi::DataType::F16> wg, ffi::Buffer<ffi::DataType::F16> bg,
                        ffi::Buffer<ffi::DataType::F16> mask,
-                       ffi::Result<ffi::Buffer<ffi::DataType::F16>> out) {
+                       ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, int64_t activation) {
     auto dx = x.dimensions();
     if (dx.size() != 2) {
         return ffi::Error::InvalidArgument("x must be [M,K]");
@@ -111,14 +113,15 @@ ffi::Error GdpWmmaImpl(cudaStream_t stream, ffi::Buffer<ffi::DataType::F16> x,
     const size_t smem = (size_t)(BM * XS_LD + 2 * BK * W_LD) * sizeof(__half) +
                         (size_t)(NWARP * 2 * FRAG * FRAG) * sizeof(float);
     dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN);
-    volta_gdp_wmma_kernel<BM, BN, BK><<<grid, NWARP * WARP, smem, stream>>>(
-        reinterpret_cast<const __half*>(x.typed_data()),
-        reinterpret_cast<const __half*>(wp.typed_data()),
-        reinterpret_cast<const __half*>(bp.typed_data()),
-        reinterpret_cast<const __half*>(wg.typed_data()),
-        reinterpret_cast<const __half*>(bg.typed_data()),
-        reinterpret_cast<const __half*>(mask.typed_data()),
-        reinterpret_cast<__half*>(out->typed_data()), M, K, N);
+    GDP_ACT_DISPATCH(
+        activation, volta_gdp_wmma_kernel<BM, BN, BK, kAct><<<grid, NWARP * WARP, smem, stream>>>(
+                        reinterpret_cast<const __half*>(x.typed_data()),
+                        reinterpret_cast<const __half*>(wp.typed_data()),
+                        reinterpret_cast<const __half*>(bp.typed_data()),
+                        reinterpret_cast<const __half*>(wg.typed_data()),
+                        reinterpret_cast<const __half*>(bg.typed_data()),
+                        reinterpret_cast<const __half*>(mask.typed_data()),
+                        reinterpret_cast<__half*>(out->typed_data()), M, K, N));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         return ffi::Error::Internal(std::string("volta_gdp_wmma launch: ") +
@@ -136,5 +139,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaGdpWmma, GdpWmmaImpl,
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Ret<ffi::Buffer<ffi::DataType::F16>>(),
+                                  .Ret<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Attr<int64_t>("activation"),
                               {ffi::Traits::kCmdBufferCompatible});

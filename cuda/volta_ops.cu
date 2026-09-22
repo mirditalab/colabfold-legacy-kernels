@@ -15,6 +15,8 @@
 
 #include "xla/ffi/api/ffi.h"
 
+#include "volta_gdp.h"
+
 namespace ffi = xla::ffi;
 
 // VOLTA_MMA_OK removes the projection below sm_75. LayerNorm stays.
@@ -94,7 +96,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaLayerNorm, LayerNormImpl,
                                   .Attr<float>("eps"),
                               {ffi::Traits::kCmdBufferCompatible});
 
-// Gated dual projection: out = mask * (x@wp + bp) * sigmoid(x@wg + bg).
+// Gated dual projection: out = mask * (x@wp + bp) * act(x@wg + bg).
 // The two GEMMs share one tile of x and keep the result in registers.
 #ifdef VOLTA_MMA_OK
 using MmaOp =
@@ -106,7 +108,7 @@ using FragB = cutlass::Array<cutlass::half_t, 2>;
 using FragC = cutlass::Array<float, 4>;
 
 // BN must be a multiple of 8, BK a multiple of 8, BM a multiple of 16.
-template <int BM, int BN, int BK>
+template <int BM, int BN, int BK, GdpAct A>
 __global__ __launch_bounds__(BM / 16 *
                              WARP) void volta_gdp_kernel(const __half* __restrict__ x, // [M, K]
                                                          const __half* __restrict__ wp,
@@ -182,7 +184,7 @@ __global__ __launch_bounds__(BM / 16 *
         }
     }
 
-// fused epilogue: + bias, sigmoid gate, row mask
+// fused epilogue: + bias, gate, row mask
 #pragma unroll
     for (int nt = 0; nt < NN; ++nt) {
 #pragma unroll
@@ -200,7 +202,7 @@ __global__ __launch_bounds__(BM / 16 *
                 }
                 const float p = accp[nt][half_i * 2 + j] + __half2float(bp[gn]);
                 const float g = accg[nt][half_i * 2 + j] + __half2float(bg[gn]);
-                const float s = 1.0f / (1.0f + __expf(-g));
+                const float s = gdp_act<A>(g);
                 out[(long long)gm * N + gn] = __float2half(mv * p * s);
             }
         }
@@ -211,7 +213,7 @@ ffi::Error GdpImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataTyp
                    ffi::Buffer<ffi::DataType::F16> wp, ffi::Buffer<ffi::DataType::F16> bp,
                    ffi::Buffer<ffi::DataType::F16> wg, ffi::Buffer<ffi::DataType::F16> bg,
                    ffi::Buffer<ffi::DataType::F16> mask,
-                   ffi::Result<ffi::Buffer<ffi::DataType::F16>> out) {
+                   ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, int64_t activation) {
     auto dx = x.dimensions();
     if (dx.size() != 2) {
         return ffi::Error::InvalidArgument("x must be [M,K]");
@@ -236,14 +238,15 @@ ffi::Error GdpImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataTyp
     }
     const size_t smem = (size_t)(BM * BK + 2 * BK * BN) * sizeof(__half);
     dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN);
-    volta_gdp_kernel<BM, BN, BK><<<grid, BM / 16 * WARP, smem, stream>>>(
-        reinterpret_cast<const __half*>(x.typed_data()),
-        reinterpret_cast<const __half*>(wp.typed_data()),
-        reinterpret_cast<const __half*>(bp.typed_data()),
-        reinterpret_cast<const __half*>(wg.typed_data()),
-        reinterpret_cast<const __half*>(bg.typed_data()),
-        reinterpret_cast<const __half*>(mask.typed_data()),
-        reinterpret_cast<__half*>(out->typed_data()), M, K, N);
+    GDP_ACT_DISPATCH(
+        activation, volta_gdp_kernel<BM, BN, BK, kAct><<<grid, BM / 16 * WARP, smem, stream>>>(
+                        reinterpret_cast<const __half*>(x.typed_data()),
+                        reinterpret_cast<const __half*>(wp.typed_data()),
+                        reinterpret_cast<const __half*>(bp.typed_data()),
+                        reinterpret_cast<const __half*>(wg.typed_data()),
+                        reinterpret_cast<const __half*>(bg.typed_data()),
+                        reinterpret_cast<const __half*>(mask.typed_data()),
+                        reinterpret_cast<__half*>(out->typed_data()), M, K, N));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         return ffi::Error::Internal(std::string("volta_gdp launch: ") + cudaGetErrorString(err));
@@ -261,6 +264,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaGdp, GdpImpl,
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Ret<ffi::Buffer<ffi::DataType::F16>>(),
+                                  .Ret<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Attr<int64_t>("activation"),
                               {ffi::Traits::kCmdBufferCompatible});
 #endif // VOLTA_MMA_OK
