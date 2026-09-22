@@ -72,167 +72,14 @@ __device__ inline void load_tile(__half* dst, const __half* src, long long base,
 // -----------------------------------------------------------------------------
 // dQ (and dBias): 16 query rows per warp, looping over every key.
 // -----------------------------------------------------------------------------
-template <int D, int BQ, int BK, bool WANT_DBIAS>
-__global__ __launch_bounds__(BQ / FRAG * WARP) void volta_wmma_bwd_dq_kernel(
+template <int D, int BK, int BQ, bool WANT_DBIAS>
+__global__ __launch_bounds__(BK / FRAG * WARP) void volta_wmma_bwd_fused_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     const __half* __restrict__ bias, const uint8_t* __restrict__ kmask,
     const __half* __restrict__ dout, const float* __restrict__ lse,
-    const float* __restrict__ delta, __half* __restrict__ dq, float* __restrict__ dbias, int N,
-    int H, int Sq, int Sk, int DR, float sm_scale) {
-    constexpr int NWARP = BQ / FRAG;
-    // The f32 scratch holds an [BQ][BK] score tile and later a [BQ][D] dQ tile.
-    constexpr int SS_LD = (BK > D ? BK : D) + 4;  // f32 ldm: a multiple of 4
-    constexpr int PS_LD = BK + 8;                 // f16 ldm: a multiple of 8
-    constexpr int TPB = NWARP * WARP;
-
-    const int lane = threadIdx.x & (WARP - 1);
-    const int warp = threadIdx.x / WARP;
-    const int tid = threadIdx.x;
-
-    // n runs fastest, so the blocks sharing a dBias tile are resident together
-    // and their atomics stay in L2.
-    const int n = blockIdx.x, h = blockIdx.y, qtile = blockIdx.z;
-    const int q0 = qtile * BQ;
-    if (q0 >= Sq) {
-        return;
-    }
-
-    extern __shared__ char smem[];
-    float* Ss = reinterpret_cast<float*>(smem);               // [BQ][SS_LD]  S, then dQ
-    float* Ts = Ss + BQ * SS_LD;                              // [BQ][SS_LD]  dP
-    __half* DSs = reinterpret_cast<__half*>(Ts + BQ * SS_LD); // [BQ][PS_LD]  dS
-    __half* Qs = DSs + BQ * PS_LD;                            // [BQ][D]
-    __half* Os = Qs + BQ * D;                                 // [BQ][D]  dout
-    __half* Ks = Os + BQ * D;                                 // [BK][D]
-    __half* Vs = Ks + BK * D;                                 // [BK][D]
-
-    const long long qkv = (long long)(n * H + h) * Sq * DR;
-    const long long kv = (long long)(n * H + h) * Sk * DR;
-    const long long bh = (long long)h * Sq * Sk;
-    const long long rowbase = (long long)(n * H + h) * Sq;
-
-    load_tile(Qs, q, qkv, q0, BQ, Sq, D, DR, tid, TPB);
-    load_tile(Os, dout, qkv, q0, BQ, Sq, D, DR, tid, TPB);
-    __syncthreads();
-
-    wmma::fragment<wmma::matrix_a, FRAG, FRAG, FRAG, __half, wmma::row_major> fq[D / FRAG];
-    wmma::fragment<wmma::matrix_a, FRAG, FRAG, FRAG, __half, wmma::row_major> fo[D / FRAG];
-#pragma unroll
-    for (int ks = 0; ks < D / FRAG; ++ks) {
-        wmma::load_matrix_sync(fq[ks], Qs + (warp * FRAG) * D + ks * FRAG, D);
-        wmma::load_matrix_sync(fo[ks], Os + (warp * FRAG) * D + ks * FRAG, D);
-    }
-
-    wmma::fragment<wmma::accumulator, FRAG, FRAG, FRAG, float> acc[D / FRAG];
-#pragma unroll
-    for (int d = 0; d < D / FRAG; ++d) {
-        wmma::fill_fragment(acc[d], 0.0f);
-    }
-
-    const float qk_scale = sm_scale * LOG2E;
-
-    for (int k0 = 0; k0 < Sk; k0 += BK) {
-        __syncthreads();  // every warp is done reading the previous Ks/Vs
-        load_tile(Ks, k, kv, k0, BK, Sk, D, DR, tid, TPB);
-        load_tile(Vs, v, kv, k0, BK, Sk, D, DR, tid, TPB);
-        __syncthreads();
-
-        // S = Q @ K^T and dP = dO @ V^T, the same GEMM shape twice.
-#pragma unroll
-        for (int nt = 0; nt < BK / FRAG; ++nt) {
-            wmma::fragment<wmma::accumulator, FRAG, FRAG, FRAG, float> as, ap;
-            wmma::fill_fragment(as, 0.0f);
-            wmma::fill_fragment(ap, 0.0f);
-#pragma unroll
-            for (int ks = 0; ks < D / FRAG; ++ks) {
-                wmma::fragment<wmma::matrix_b, FRAG, FRAG, FRAG, __half, wmma::col_major> fk, fv;
-                wmma::load_matrix_sync(fk, Ks + (nt * FRAG) * D + ks * FRAG, D);
-                wmma::load_matrix_sync(fv, Vs + (nt * FRAG) * D + ks * FRAG, D);
-                wmma::mma_sync(as, fq[ks], fk, as);
-                wmma::mma_sync(ap, fo[ks], fv, ap);
-            }
-            wmma::store_matrix_sync(Ss + (warp * FRAG) * SS_LD + nt * FRAG, as, SS_LD,
-                                    wmma::mem_row_major);
-            wmma::store_matrix_sync(Ts + (warp * FRAG) * SS_LD + nt * FRAG, ap, SS_LD,
-                                    wmma::mem_row_major);
-        }
-        __syncwarp();
-
-        // P from the forward's statistic; dS = P * (dP - delta). Scalar, on the
-        // warp's own 16 rows, so no block-wide barrier is needed.
-        for (int i = lane; i < FRAG * BK; i += WARP) {
-            const int r = i / BK, c = i - r * BK;
-            const int r_loc = warp * FRAG + r;
-            const int gq = q0 + r_loc, gk = k0 + c;
-            // the forward's clamped logit, so an all-masked row differentiates
-            // the uniform softmax it was given
-            // padded rows read the last real one: the value is discarded, and
-            // the address stays in range
-            const int gqc = gq < Sq ? gq : Sq - 1, gkc = gk < Sk ? gk : Sk - 1;
-            const long long bi = bh + (long long)gqc * Sk + gkc;
-            const bool live = gq < Sq && gk < Sk && kmask[(long long)n * Sk + gk] != 0;
-            // the clamped logit the forward used, so a row with every key masked
-            // differentiates the uniform softmax it was given
-            const float l2 = live ? (Ss[r_loc * SS_LD + c] * qk_scale +
-                                     __half2float(bias[bi]) * LOG2E)
-                                  : (MASKED_LOGIT * LOG2E);
-            const float p = exp2f(l2 - lse[rowbase + gqc]);
-            // a masked logit is a constant, so nothing flows back to q, k or the
-            // bias through it
-            const float g = live ? p * (Ts[r_loc * SS_LD + c] - delta[rowbase + gqc]) : 0.f;
-            // dBias sees the gradient of the pre-softmax logit itself,
-            // unscaled: the bias is added AFTER the q.k scaling.
-            if constexpr (WANT_DBIAS) {
-                if (gq < Sq && gk < Sk && g != 0.f) {
-                    atomicAdd(&dbias[bi], g);
-                }
-            }
-            DSs[r_loc * PS_LD + c] = __float2half(g);
-        }
-        __syncwarp();
-
-        // dQ += dS @ K
-#pragma unroll
-        for (int d = 0; d < D / FRAG; ++d) {
-#pragma unroll
-            for (int ks = 0; ks < BK / FRAG; ++ks) {
-                wmma::fragment<wmma::matrix_a, FRAG, FRAG, FRAG, __half, wmma::row_major> fa;
-                wmma::fragment<wmma::matrix_b, FRAG, FRAG, FRAG, __half, wmma::row_major> fb;
-                wmma::load_matrix_sync(fa, DSs + (warp * FRAG) * PS_LD + ks * FRAG, PS_LD);
-                wmma::load_matrix_sync(fb, Ks + (ks * FRAG) * D + d * FRAG, D);
-                wmma::mma_sync(acc[d], fa, fb, acc[d]);
-            }
-        }
-    }
-
-    __syncwarp();
-#pragma unroll
-    for (int d = 0; d < D / FRAG; ++d) {
-        wmma::store_matrix_sync(Ss + (warp * FRAG) * SS_LD + d * FRAG, acc[d], SS_LD,
-                                wmma::mem_row_major);
-    }
-    __syncwarp();
-    for (int i = lane; i < FRAG * DR; i += WARP) {
-        const int r = i / DR, c = i - r * DR;
-        const int gq = q0 + warp * FRAG + r;
-        if (gq < Sq) {
-            dq[qkv + (long long)gq * DR + c] =
-                __float2half(Ss[(warp * FRAG + r) * SS_LD + c] * sm_scale);
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// dK and dV: 16 key rows per warp, looping over every query. Everything is the
-// transposed problem, so the key index is the GEMM's m and the query its n.
-// -----------------------------------------------------------------------------
-template <int D, int BK, int BQ>
-__global__ __launch_bounds__(BK / FRAG * WARP) void volta_wmma_bwd_dkdv_kernel(
-    const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
-    const __half* __restrict__ bias, const uint8_t* __restrict__ kmask,
-    const __half* __restrict__ dout, const float* __restrict__ lse,
-    const float* __restrict__ delta, __half* __restrict__ dk, __half* __restrict__ dv, int N,
-    int H, int Sq, int Sk, int DR, float sm_scale) {
+    const float* __restrict__ delta, float* __restrict__ dq_accum, __half* __restrict__ dk,
+    __half* __restrict__ dv, float* __restrict__ dbias, int N, int H, int Sq, int Sk, int DR,
+    float sm_scale) {
     constexpr int NWARP = BK / FRAG;
     constexpr int SS_LD = (BQ > D ? BQ : D) + 4;
     constexpr int PS_LD = BQ + 8;
@@ -330,6 +177,13 @@ __global__ __launch_bounds__(BK / FRAG * WARP) void volta_wmma_bwd_dkdv_kernel(
             const float ds = live ? p * (Ts[k_loc * SS_LD + c] - delta[rowbase + gqc]) : 0.f;
             Ps[k_loc * PS_LD + c] = __float2half(p);
             DSs[k_loc * PS_LD + c] = __float2half(ds);
+            // dBias sees the gradient of the pre-softmax logit itself, unscaled:
+            // the bias is added AFTER the q.k scaling.
+            if constexpr (WANT_DBIAS) {
+                if (ds != 0.f) {
+                    atomicAdd(&dbias[bh + (long long)gqc * Sk + gkc], ds);
+                }
+            }
         }
         __syncwarp();
 
@@ -348,6 +202,47 @@ __global__ __launch_bounds__(BK / FRAG * WARP) void volta_wmma_bwd_dkdv_kernel(
                 wmma::mma_sync(acc_dk[d], fds, fqb, acc_dk[d]);
             }
         }
+
+        // dQ wants dS, and DSs holds dS^T; a col_major fragment is that
+        // transpose for free. Every key tile adds to the same rows, thus float32
+        // and atomics.
+        __syncthreads();
+        for (int qb = warp; qb < BQ / FRAG; qb += NWARP) {
+            wmma::fragment<wmma::accumulator, FRAG, FRAG, FRAG, float> acc_dq[D / FRAG];
+#pragma unroll
+            for (int d = 0; d < D / FRAG; ++d) {
+                wmma::fill_fragment(acc_dq[d], 0.0f);
+            }
+#pragma unroll
+            for (int ks = 0; ks < BK / FRAG; ++ks) {
+                wmma::fragment<wmma::matrix_a, FRAG, FRAG, FRAG, __half, wmma::col_major> fds2;
+                wmma::load_matrix_sync(fds2, DSs + (ks * FRAG) * PS_LD + qb * FRAG, PS_LD);
+#pragma unroll
+                for (int d = 0; d < D / FRAG; ++d) {
+                    wmma::fragment<wmma::matrix_b, FRAG, FRAG, FRAG, __half, wmma::row_major> fkb;
+                    wmma::load_matrix_sync(fkb, Ks + (ks * FRAG) * D + d * FRAG, D);
+                    wmma::mma_sync(acc_dq[d], fds2, fkb, acc_dq[d]);
+                }
+            }
+#pragma unroll
+            for (int d = 0; d < D / FRAG; ++d) {
+                wmma::store_matrix_sync(Ss + (warp * FRAG) * SS_LD + d * FRAG, acc_dq[d], SS_LD,
+                                        wmma::mem_row_major);
+            }
+            __syncwarp();
+            for (int i = lane; i < FRAG * DR; i += WARP) {
+                const int r = i / DR, c = i - r * DR;
+                const int gq = qq + qb * FRAG + r;
+                if (gq < Sq) {
+                    const float g = Ss[(warp * FRAG + r) * SS_LD + c] * sm_scale;
+                    if (g != 0.f) {
+                        atomicAdd(&dq_accum[qkv + (long long)gq * DR + c], g);
+                    }
+                }
+            }
+            __syncwarp();
+        }
+        __syncthreads();
     }
 
     __syncwarp();
@@ -367,6 +262,14 @@ __global__ __launch_bounds__(BK / FRAG * WARP) void volta_wmma_bwd_dkdv_kernel(
                 __float2half(Ss[(warp * FRAG + r) * SS_LD + c] * sm_scale);
             dv[kv + (long long)gk * DR + c] = __float2half(Ts[(warp * FRAG + r) * SS_LD + c]);
         }
+    }
+}
+
+static __global__ void to_half(const float* __restrict__ src, __half* __restrict__ dst,
+                               long long n) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long long)gridDim.x * blockDim.x) {
+        dst[i] = __float2half(src[i]);
     }
 }
 
@@ -396,47 +299,43 @@ static bool bias_is(const A& a, int H, int Sq, int Sk) {
 }
 
 template <int D, int BQ, int BK, bool WANT_DBIAS>
-static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, const __half* k,
-                             const __half* v, const __half* bias, const uint8_t* kmask,
-                             const __half* dout, const float* lse, const float* delta, __half* dq,
-                             __half* dk, __half* dv, float* dbias, int N, int H, int Sq, int Sk,
-                             int DR, float scale) {
-    constexpr int DQ_SS = (BK > D ? BK : D) + 4;
-    constexpr int DKDV_SS = (BQ > D ? BQ : D) + 4;
-    constexpr size_t smem_dq =
-        (size_t)(2 * BQ * DQ_SS) * sizeof(float) +
-        (size_t)(BQ * (BK + 8) + 2 * BQ * D + 2 * BK * D) * sizeof(__half);
-    constexpr size_t smem_dkdv =
-        (size_t)(2 * BK * DKDV_SS) * sizeof(float) +
+static ffi::Error launch_bwd(cudaStream_t stream, int device, ffi::ScratchAllocator& scratch,
+                             const __half* q, const __half* k, const __half* v,
+                             const __half* bias, const uint8_t* kmask, const __half* dout,
+                             const float* lse, const float* delta, __half* dq, __half* dk,
+                             __half* dv, float* dbias, int N, int H, int Sq, int Sk, int DR,
+                             float scale) {
+    constexpr int SS_LD = (BQ > D ? BQ : D) + 4;
+    constexpr size_t smem =
+        (size_t)(2 * BK * SS_LD) * sizeof(float) +
         (size_t)(2 * BK * (BQ + 8) + 2 * BK * D + 2 * BQ * D) * sizeof(__half);
     const int max_smem = bwd_shared_limit(device);
-    const size_t need = smem_dq > smem_dkdv ? smem_dq : smem_dkdv;
-    if ((int)need > max_smem) {
-        return ffi::Error::InvalidArgument("volta_wmma_bwd: needs " + std::to_string(need / 1024) +
+    if ((int)smem > max_smem) {
+        return ffi::Error::InvalidArgument("volta_wmma_bwd: needs " + std::to_string(smem / 1024) +
                                            " KB shared, device allows " +
                                            std::to_string(max_smem / 1024) + " KB");
     }
 
-    // dBias accumulates, thus it starts at zero, and stays zero when unwanted.
-    const long long nb = (long long)H * Sq * Sk;
-    zero_f32<<<256, 256, 0, stream>>>(dbias, nb);
-
-    auto kern_dq = volta_wmma_bwd_dq_kernel<D, BQ, BK, WANT_DBIAS>;
-    if (smem_dq > 48 * 1024) {
-        cudaFuncSetAttribute(kern_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_dq);
+    // dQ lands from every key tile, thus it accumulates in float32 and is cast
+    // once at the end. The scratch is XLA's, and it goes away with the call.
+    const long long nq = (long long)N * H * Sq * DR;
+    auto mem = scratch.Allocate(nq * sizeof(float), alignof(float));
+    if (!mem.has_value()) {
+        return ffi::Error::Internal("volta_wmma_bwd: no scratch for the dQ accumulator");
     }
-    dim3 grid_dq(N, H, (Sq + BQ - 1) / BQ);
-    kern_dq<<<grid_dq, (BQ / FRAG) * WARP, smem_dq, stream>>>(
-        q, k, v, bias, kmask, dout, lse, delta, dq, dbias, N, H, Sq, Sk, DR, scale);
+    float* dq_accum = reinterpret_cast<float*>(*mem);
+    zero_f32<<<256, 256, 0, stream>>>(dq_accum, nq);
+    zero_f32<<<256, 256, 0, stream>>>(dbias, (long long)H * Sq * Sk);
 
-    auto kern_dkdv = volta_wmma_bwd_dkdv_kernel<D, BK, BQ>;
-    if (smem_dkdv > 48 * 1024) {
-        cudaFuncSetAttribute(kern_dkdv, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)smem_dkdv);
+    auto kern = volta_wmma_bwd_fused_kernel<D, BK, BQ, WANT_DBIAS>;
+    if (smem > 48 * 1024) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     }
-    dim3 grid_dkdv((Sk + BK - 1) / BK, H, N);
-    kern_dkdv<<<grid_dkdv, (BK / FRAG) * WARP, smem_dkdv, stream>>>(
-        q, k, v, bias, kmask, dout, lse, delta, dk, dv, N, H, Sq, Sk, DR, scale);
+    dim3 grid((Sk + BK - 1) / BK, H, N);
+    kern<<<grid, (BK / FRAG) * WARP, smem, stream>>>(q, k, v, bias, kmask, dout, lse, delta,
+                                                     dq_accum, dk, dv, dbias, N, H, Sq, Sk, DR,
+                                                     scale);
+    to_half<<<256, 256, 0, stream>>>(dq_accum, dq, nq);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -446,7 +345,8 @@ static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, c
     return ffi::Error::Success();
 }
 
-ffi::Error VoltaWmmaBwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
+ffi::Error VoltaWmmaBwdImpl(cudaStream_t stream, int32_t device, ffi::ScratchAllocator scratch,
+                            ffi::Buffer<ffi::DataType::F16> q,
                             ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
                             ffi::Buffer<ffi::DataType::F16> bias,
                             ffi::Buffer<ffi::DataType::U8> kmask,
@@ -492,12 +392,13 @@ ffi::Error VoltaWmmaBwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi
     // 64 where a 64-row query tile is a third faster. 63 KB at most.
 #define DISPATCH_BWD_T(TILE, DD, BQ)                                                               \
     if (D == (DD))                                                                                 \
-        return want_dbias ? launch_bwd<TILE, BQ, 32, true>(stream, device, qp, kp, vp, bp, mp,     \
-                                                           dop, lp, dlp, dqp, dkp, dvp, dbp, N,   \
-                                                           H, Sq, Sk, (DD), scale)                 \
-                          : launch_bwd<TILE, BQ, 32, false>(stream, device, qp, kp, vp, bp, mp,    \
-                                                            dop, lp, dlp, dqp, dkp, dvp, dbp, N,  \
-                                                            H, Sq, Sk, (DD), scale);
+        return want_dbias                                                                          \
+                   ? launch_bwd<TILE, BQ, 32, true>(stream, device, scratch, qp, kp, vp, bp, mp,   \
+                                                    dop, lp, dlp, dqp, dkp, dvp, dbp, N, H, Sq,   \
+                                                    Sk, (DD), scale)                               \
+                   : launch_bwd<TILE, BQ, 32, false>(stream, device, scratch, qp, kp, vp, bp, mp, \
+                                                     dop, lp, dlp, dqp, dkp, dvp, dbp, N, H, Sq,  \
+                                                     Sk, (DD), scale);
     // head 8 rides in a 16-wide tile, zero-padded, as it does in the forward.
     DISPATCH_BWD_T(16, 8, 32)
     DISPATCH_BWD_T(16, 16, 32)
@@ -513,6 +414,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmmaBwd, VoltaWmmaBwdImpl,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>()
                                   .Ctx<ffi::DeviceOrdinal>()
+                                  .Ctx<ffi::ScratchAllocator>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()

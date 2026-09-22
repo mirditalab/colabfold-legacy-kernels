@@ -244,7 +244,8 @@ def tiny_case():
 
 
 def repeat_case():
-  """dQ/dK/dV are deterministic; dBias goes through atomics and need not be."""
+  """dK/dV are deterministic. dQ and dBias arrive by atomic add, from every key
+  tile and every batch row, so their summation order is not fixed."""
   print('repeated calls')
   q, k, v, bias, km, dout = inputs(3, 4, 96, 96, 32, 0)
   scale = 32.0 ** -0.5
@@ -253,13 +254,14 @@ def repeat_case():
   a = bwd(q, k, v, bias, km, dout, lse, delta, scale)
   b = bwd(q, k, v, bias, km, dout, lse, delta, scale)
   bad = 0
-  for name, x, y in zip(('dq', 'dk', 'dv'), a, b):
+  for name, x, y in zip(('dk', 'dv'), a[1:3], b[1:3]):
     if not np.array_equal(np.asarray(x), np.asarray(y)):
       print(f'  {name} differs between identical calls')
       bad += 1
-  r = rel(a[3], b[3])
-  print(f'  dbias run-to-run rel {r:.2e} (atomics, so only bounded)')
-  bad += r >= 1e-3
+  for name, i in (('dq', 0), ('dbias', 3)):
+    r = rel(a[i], b[i])
+    print(f'  {name:5s} run-to-run rel {r:.2e} (atomics, so only bounded)')
+    bad += r >= 1e-3
   print('  ->', 'OK' if not bad else f'FAIL ({bad})')
   return bad
 
