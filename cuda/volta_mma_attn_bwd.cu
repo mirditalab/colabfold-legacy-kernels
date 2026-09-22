@@ -93,210 +93,32 @@ __device__ inline void load_tile(__half* dst, const __half* src, long long base,
 // -----------------------------------------------------------------------------
 // dQ (and dBias): 16 query rows per warp, looping over every key.
 // -----------------------------------------------------------------------------
-template <int D, int BQ, int BK, bool WANT_DBIAS>
-__global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_bwd_dq_kernel(
+template <int D, int BK, int BQ, bool WANT_DBIAS>
+__global__ __launch_bounds__(BK / MMA_M * WARP) void volta_mma_bwd_fused_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     const __half* __restrict__ bias, const uint8_t* __restrict__ kmask,
     const __half* __restrict__ dout, const float* __restrict__ lse,
-    const float* __restrict__ delta, __half* __restrict__ dq, float* __restrict__ dbias, int N,
-    int H, int Sq, int Sk, float sm_scale) {
-    constexpr int NWARP = BQ / MMA_M;
-    constexpr int NK = BK / MMA_N;
-    constexpr int ND = D / MMA_N;
-    constexpr int KSTEP = D / MMA_K;
-
-    const int lane = threadIdx.x & (WARP - 1);
-    const int warp = threadIdx.x / WARP;
-    const int tid = threadIdx.x;
-    const int nthreads = NWARP * WARP;
-
-    // n runs fastest, so the blocks sharing a dBias tile are resident together
-    // and their atomics stay in L2.
-    const int n = blockIdx.x, h = blockIdx.y, qtile = blockIdx.z;
-    const int q0 = qtile * BQ;
-    if (q0 >= Sq) {
-        return;
-    }
-    const int lr = lane >> 2;
-    const int lc = (lane & 3) * 2;
-
-    extern __shared__ char smem[];
-    __half* Qs = reinterpret_cast<__half*>(smem);
-    __half* Os = Qs + BQ * D;   // dout tile
-    __half* Ks = Os + BQ * D;
-    __half* Vs = Ks + BK * D;
-    __half* Bs = Vs + BK * D;   // [BQ][BK]
-
-    const long long qkv = (long long)(n * H + h) * Sq * D;
-    const long long kv = (long long)(n * H + h) * Sk * D;
-    const long long bh = (long long)h * Sq * Sk;
-    const long long rowbase = (long long)(n * H + h) * Sq;
-
-    load_tile(Qs, q, qkv, q0, BQ, Sq, D, tid, nthreads);
-    load_tile(Os, dout, qkv, q0, BQ, Sq, D, tid, nthreads);
-    __syncthreads();
-
-    FragA fq[KSTEP], fo[KSTEP];
-#pragma unroll
-    for (int ks = 0; ks < KSTEP; ++ks) {
-        const int qrow = warp * MMA_M + lr;
-#pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            fq[ks][0 + j] = reinterpret_cast<cutlass::half_t&>(Qs[qrow * D + ks * MMA_K + lc + j]);
-            fq[ks][2 + j] =
-                reinterpret_cast<cutlass::half_t&>(Qs[(qrow + 8) * D + ks * MMA_K + lc + j]);
-            fo[ks][0 + j] = reinterpret_cast<cutlass::half_t&>(Os[qrow * D + ks * MMA_K + lc + j]);
-            fo[ks][2 + j] =
-                reinterpret_cast<cutlass::half_t&>(Os[(qrow + 8) * D + ks * MMA_K + lc + j]);
-        }
-    }
-
-    // Per-lane row statistics: the lane's two query rows.
-    float lse_r[2], del_r[2];
-#pragma unroll
-    for (int half_i = 0; half_i < 2; ++half_i) {
-        const int gq = q0 + warp * MMA_M + lr + half_i * 8;
-        lse_r[half_i] = (gq < Sq) ? lse[rowbase + gq] : 0.f;
-        del_r[half_i] = (gq < Sq) ? delta[rowbase + gq] : 0.f;
-    }
-
-    FragC acc[ND];
-#pragma unroll
-    for (int d = 0; d < ND; ++d) {
-        acc[d].clear();
-    }
-
-    MmaOp mma_op;
-    const float qk_scale = sm_scale * LOG2E;
-
-    for (int k0 = 0; k0 < Sk; k0 += BK) {
-        __syncthreads();
-        for (int i = tid; i < BK * D; i += nthreads) {
-            int r = i / D, c = i - r * D;
-            int gk = k0 + r;
-            bool ok = (gk < Sk);
-            Ks[i] = ok ? k[kv + (long long)gk * D + c] : __float2half(0.f);
-            Vs[i] = ok ? v[kv + (long long)gk * D + c] : __float2half(0.f);
-        }
-        for (int i = tid; i < BQ * BK; i += nthreads) {
-            int r = i / BK, c = i - r * BK;
-            int gq = q0 + r, gk = k0 + c;
-            Bs[i] = (gq < Sq && gk < Sk) ? bias[bh + (long long)gq * Sk + gk] : __float2half(0.f);
-        }
-        __syncthreads();
-
-        // S = Q @ K^T and dP = dO @ V^T, the same GEMM shape twice.
-        FragC s[NK], dp[NK];
-#pragma unroll
-        for (int nt = 0; nt < NK; ++nt) {
-            s[nt].clear();
-            dp[nt].clear();
-#pragma unroll
-            for (int ks = 0; ks < KSTEP; ++ks) {
-                FragB fk, fv;
-#pragma unroll
-                for (int j = 0; j < 2; ++j) {
-                    fk[j] = reinterpret_cast<cutlass::half_t&>(
-                        Ks[(nt * MMA_N + lr) * D + ks * MMA_K + lc + j]);
-                    fv[j] = reinterpret_cast<cutlass::half_t&>(
-                        Vs[(nt * MMA_N + lr) * D + ks * MMA_K + lc + j]);
-                }
-                mma_op(s[nt], fq[ks], fk, s[nt]);
-                mma_op(dp[nt], fo[ks], fv, dp[nt]);
-            }
-        }
-
-        // P from the forward's statistic; dS = P * (dP - delta).
-        FragA ds[NK];
-#pragma unroll
-        for (int nt = 0; nt < NK; ++nt) {
-#pragma unroll
-            for (int half_i = 0; half_i < 2; ++half_i) {
-#pragma unroll
-                for (int j = 0; j < 2; ++j) {
-                    const int idx = half_i * 2 + j;
-                    const int r_loc = warp * MMA_M + lr + half_i * 8;
-                    const int gq = q0 + r_loc;
-                    const int gk = k0 + nt * MMA_N + lc + j;
-                    // the forward's clamped logit, so an all-masked row
-                    // differentiates the uniform softmax it was given
-                    const bool live = gq < Sq && gk < Sk && kmask[(long long)n * Sk + gk] != 0;
-                    const float l2 =
-                        live ? (s[nt][idx] * qk_scale +
-                                __half2float(Bs[r_loc * BK + nt * MMA_N + lc + j]) * LOG2E)
-                             : (MASKED_LOGIT * LOG2E);
-                    const float p = exp2f(l2 - lse_r[half_i]);
-                    // a masked logit is a constant, so nothing flows back to q,
-                    // k or the bias through it
-                    const float g = live ? p * (dp[nt][idx] - del_r[half_i]) : 0.f;
-                    ds[nt][idx] = cutlass::half_t(g);
-                    // dBias sees the gradient of the pre-softmax logit itself,
-                    // unscaled: the bias is added AFTER the q.k scaling.
-                    if constexpr (WANT_DBIAS) {
-                        if (gq < Sq && gk < Sk && g != 0.f) {
-                            atomicAdd(&dbias[bh + (long long)gq * Sk + gk], g);
-                        }
-                    }
-                }
-            }
-        }
-
-        // dQ += dS @ K   (dS is in C layout, which is also the A layout)
-#pragma unroll
-        for (int d = 0; d < ND; ++d) {
-#pragma unroll
-            for (int nt = 0; nt < NK; ++nt) {
-                FragB fk;
-#pragma unroll
-                for (int j = 0; j < 2; ++j) {
-                    fk[j] = reinterpret_cast<cutlass::half_t&>(
-                        Ks[(nt * MMA_N + lc + j) * D + d * MMA_N + lr]);
-                }
-                mma_op(acc[d], ds[nt], fk, acc[d]);
-            }
-        }
-    }
-
-#pragma unroll
-    for (int d = 0; d < ND; ++d) {
-#pragma unroll
-        for (int half_i = 0; half_i < 2; ++half_i) {
-            const int gq = q0 + warp * MMA_M + lr + half_i * 8;
-            if (gq >= Sq) {
-                continue;
-            }
-#pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                const int col = d * MMA_N + lc + j;
-                dq[qkv + (long long)gq * D + col] =
-                    __float2half(acc[d][half_i * 2 + j] * sm_scale);
-            }
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// dK and dV: 16 key rows per warp, looping over every query. Everything is the
-// transposed problem, so the key index is the GEMM's m and the query its n.
-// -----------------------------------------------------------------------------
-template <int D, int BK, int BQ>
-__global__ __launch_bounds__(BK / MMA_M * WARP) void volta_mma_bwd_dkdv_kernel(
-    const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
-    const __half* __restrict__ bias, const uint8_t* __restrict__ kmask,
-    const __half* __restrict__ dout, const float* __restrict__ lse,
-    const float* __restrict__ delta, __half* __restrict__ dk, __half* __restrict__ dv, int N,
-    int H, int Sq, int Sk, float sm_scale) {
+    const float* __restrict__ delta, float* __restrict__ dq_accum, __half* __restrict__ dk,
+    __half* __restrict__ dv, float* __restrict__ dbias, int N, int H, int Sq, int Sk,
+    float sm_scale, bool n_fastest) {
     constexpr int NWARP = BK / MMA_M;
     constexpr int NQ = BQ / MMA_N;
     constexpr int ND = D / MMA_N;
     constexpr int KSTEP = D / MMA_K;
+    constexpr int QB = BQ / MMA_M;      // query row blocks, for the dQ gemm
+    constexpr int DS_LD = BQ + 8;       // dS^T stride, padded off the banks
 
     const int lane = threadIdx.x & (WARP - 1);
     const int warp = threadIdx.x / WARP;
     const int tid = threadIdx.x;
     const int nthreads = NWARP * WARP;
 
-    const int ktile = blockIdx.x, h = blockIdx.y, n = blockIdx.z;
+    // The bias tile is shared across the batch and is the largest thing read, so
+    // past a certain N the batch runs fastest to hold it in L2. Below that the
+    // key tile does, which suits the dQ atomics.
+    const int h = blockIdx.y;
+    const int n = n_fastest ? blockIdx.x : blockIdx.z;
+    const int ktile = n_fastest ? blockIdx.z : blockIdx.x;
     const int k0 = ktile * BK;
     if (k0 >= Sk) {
         return;
@@ -310,7 +132,8 @@ __global__ __launch_bounds__(BK / MMA_M * WARP) void volta_mma_bwd_dkdv_kernel(
     __half* Qs = Vs + BK * D;
     __half* Os = Qs + BQ * D;      // dout tile
     __half* Bs = Os + BQ * D;      // [BK][BQ], transposed
-    float* Ls = reinterpret_cast<float*>(Bs + BK * BQ);   // lse   [BQ]
+    __half* DSs = Bs + BK * BQ;    // [BK][DS_LD], dS^T for the dQ gemm
+    float* Ls = reinterpret_cast<float*>(DSs + BK * DS_LD);   // lse   [BQ]
     float* Ds = Ls + BQ;                                  // delta [BQ]
 
     const long long qkv = (long long)(n * H + h) * Sq * D;
@@ -412,9 +235,17 @@ __global__ __launch_bounds__(BK / MMA_M * WARP) void volta_mma_bwd_dkdv_kernel(
                     // P carries dV even where the mask clamped the logit, but dS
                     // does not: a constant logit has no gradient
                     const float p = exp2f(l2 - Ls[q_loc]);
+                    const float g = alive ? p * (dpt[nt][idx] - Ds[q_loc]) : 0.f;
                     pt[nt][idx] = cutlass::half_t(p);
-                    dst[nt][idx] =
-                        cutlass::half_t(alive ? p * (dpt[nt][idx] - Ds[q_loc]) : 0.f);
+                    dst[nt][idx] = cutlass::half_t(g);
+                    DSs[k_loc * DS_LD + q_loc] = __float2half(g);
+                    // dBias sees the gradient of the pre-softmax logit itself,
+                    // unscaled: the bias is added AFTER the q.k scaling.
+                    if constexpr (WANT_DBIAS) {
+                        if (g != 0.f) {
+                            atomicAdd(&dbias[bh + (long long)gq * Sk + k0 + k_loc], g);
+                        }
+                    }
                 }
             }
         }
@@ -436,6 +267,57 @@ __global__ __launch_bounds__(BK / MMA_M * WARP) void volta_mma_bwd_dkdv_kernel(
                 mma_op(acc_dk[d], dst[nt], fq2, acc_dk[d]);
             }
         }
+
+        // dQ needs dS, not dS^T, and the two layouts differ by a transpose that
+        // only shared memory can do. DSs took the tile as it was computed.
+        __syncthreads();
+
+        for (int qb = warp; qb < QB; qb += NWARP) {
+            FragC acc_dq[ND];
+#pragma unroll
+            for (int d = 0; d < ND; ++d) {
+                acc_dq[d].clear();
+            }
+#pragma unroll
+            for (int kstep = 0; kstep < BK / MMA_K; ++kstep) {
+                FragA fds;
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int krow = kstep * MMA_K + lc + j;
+                    fds[0 + j] = reinterpret_cast<cutlass::half_t&>(
+                        DSs[krow * DS_LD + qb * MMA_M + lr]);
+                    fds[2 + j] = reinterpret_cast<cutlass::half_t&>(
+                        DSs[krow * DS_LD + qb * MMA_M + lr + 8]);
+                }
+#pragma unroll
+                for (int d = 0; d < ND; ++d) {
+                    FragB fkb;
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        fkb[j] = reinterpret_cast<cutlass::half_t&>(
+                            Ks[(kstep * MMA_K + lc + j) * D + d * MMA_N + lr]);
+                    }
+                    mma_op(acc_dq[d], fds, fkb, acc_dq[d]);
+                }
+            }
+#pragma unroll
+            for (int d = 0; d < ND; ++d) {
+#pragma unroll
+                for (int half_i = 0; half_i < 2; ++half_i) {
+                    const int gq = qq + qb * MMA_M + lr + half_i * 8;
+                    if (gq >= Sq) {
+                        continue;
+                    }
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        const float g = acc_dq[d][half_i * 2 + j] * sm_scale;
+                        if (g != 0.f) {
+                            atomicAdd(&dq_accum[qkv + (long long)gq * D + d * MMA_N + lc + j], g);
+                        }
+                    }
+                }
+            }
+        }
     }
 
 #pragma unroll
@@ -454,6 +336,14 @@ __global__ __launch_bounds__(BK / MMA_M * WARP) void volta_mma_bwd_dkdv_kernel(
                 dv[kv + (long long)gk * D + col] = __float2half(acc_dv[d][idx]);
             }
         }
+    }
+}
+
+static __global__ void to_half(const float* __restrict__ src, __half* __restrict__ dst,
+                               long long n) {
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long long)gridDim.x * blockDim.x) {
+        dst[i] = __float2half(src[i]);
     }
 }
 
@@ -483,42 +373,43 @@ static bool bias_is(const A& a, int H, int Sq, int Sk) {
 }
 
 template <int D, int BQ, int BK, bool WANT_DBIAS>
-static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, const __half* k,
-                             const __half* v, const __half* bias, const uint8_t* kmask,
-                             const __half* dout, const float* lse, const float* delta, __half* dq,
-                             __half* dk, __half* dv, float* dbias, int N, int H, int Sq, int Sk,
-                             float scale) {
-    constexpr size_t smem_dq = (size_t)(2 * BQ * D + 2 * BK * D + BQ * BK) * sizeof(__half);
-    constexpr size_t smem_dkdv =
-        (size_t)(2 * BK * D + 2 * BQ * D + BK * BQ) * sizeof(__half) + 2 * BQ * sizeof(float);
+static ffi::Error launch_bwd(cudaStream_t stream, int device, ffi::ScratchAllocator& scratch,
+                             const __half* q, const __half* k, const __half* v,
+                             const __half* bias, const uint8_t* kmask, const __half* dout,
+                             const float* lse, const float* delta, __half* dq, __half* dk,
+                             __half* dv, float* dbias, int N, int H, int Sq, int Sk, float scale) {
+    constexpr size_t smem = (size_t)(2 * BK * D + 2 * BQ * D + BK * BQ + BK * (BQ + 8)) *
+                                sizeof(__half) +
+                            2 * BQ * sizeof(float);
     const int max_smem = bwd_shared_limit(device);
-    const size_t need = smem_dq > smem_dkdv ? smem_dq : smem_dkdv;
-    if ((int)need > max_smem) {
-        return ffi::Error::InvalidArgument("volta_mma_bwd: needs " + std::to_string(need / 1024) +
+    if ((int)smem > max_smem) {
+        return ffi::Error::InvalidArgument("volta_mma_bwd: needs " + std::to_string(smem / 1024) +
                                            " KB shared, device allows " +
                                            std::to_string(max_smem / 1024) + " KB");
     }
 
-    // dBias accumulates, thus it starts at zero, and stays zero when unwanted.
-    const long long nb = (long long)H * Sq * Sk;
-    zero_f32<<<256, 256, 0, stream>>>(dbias, nb);
-
-    auto kern_dq = volta_mma_bwd_dq_kernel<D, BQ, BK, WANT_DBIAS>;
-    if (smem_dq > 48 * 1024) {
-        cudaFuncSetAttribute(kern_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_dq);
+    // dQ lands from every key tile, thus it accumulates in float32 and is cast
+    // once at the end. The scratch is XLA's, and it goes away with the call.
+    const long long nq = (long long)N * H * Sq * D;
+    auto mem = scratch.Allocate(nq * sizeof(float), alignof(float));
+    if (!mem.has_value()) {
+        return ffi::Error::Internal("volta_mma_bwd: no scratch for the dQ accumulator");
     }
-    dim3 grid_dq(N, H, (Sq + BQ - 1) / BQ);
-    kern_dq<<<grid_dq, (BQ / MMA_M) * WARP, smem_dq, stream>>>(
-        q, k, v, bias, kmask, dout, lse, delta, dq, dbias, N, H, Sq, Sk, scale);
+    float* dq_accum = reinterpret_cast<float*>(*mem);
+    zero_f32<<<256, 256, 0, stream>>>(dq_accum, nq);
+    zero_f32<<<256, 256, 0, stream>>>(dbias, (long long)H * Sq * Sk);
 
-    auto kern_dkdv = volta_mma_bwd_dkdv_kernel<D, BK, BQ>;
-    if (smem_dkdv > 48 * 1024) {
-        cudaFuncSetAttribute(kern_dkdv, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)smem_dkdv);
+    auto kern = volta_mma_bwd_fused_kernel<D, BK, BQ, WANT_DBIAS>;
+    if (smem > 48 * 1024) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     }
-    dim3 grid_dkdv((Sk + BK - 1) / BK, H, N);
-    kern_dkdv<<<grid_dkdv, (BK / MMA_M) * WARP, smem_dkdv, stream>>>(
-        q, k, v, bias, kmask, dout, lse, delta, dk, dv, N, H, Sq, Sk, scale);
+    const int nkt = (Sk + BK - 1) / BK;
+    const bool n_fastest = N >= 64;
+    dim3 grid = n_fastest ? dim3(N, H, nkt) : dim3(nkt, H, N);
+    kern<<<grid, (BK / MMA_M) * WARP, smem, stream>>>(q, k, v, bias, kmask, dout, lse, delta,
+                                                      dq_accum, dk, dv, dbias, N, H, Sq, Sk,
+                                                      scale, n_fastest);
+    to_half<<<256, 256, 0, stream>>>(dq_accum, dq, nq);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -528,7 +419,8 @@ static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, c
     return ffi::Error::Success();
 }
 
-ffi::Error VoltaMmaBwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
+ffi::Error VoltaMmaBwdImpl(cudaStream_t stream, int32_t device, ffi::ScratchAllocator scratch,
+                           ffi::Buffer<ffi::DataType::F16> q,
                            ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
                            ffi::Buffer<ffi::DataType::F16> bias,
                            ffi::Buffer<ffi::DataType::U8> kmask,
@@ -575,10 +467,12 @@ ffi::Error VoltaMmaBwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi:
 #define DISPATCH_BWD(DD)                                                                           \
     if (D == (DD))                                                                                 \
         return want_dbias                                                                          \
-                   ? launch_bwd<DD, 32, 32, true>(stream, device, qp, kp, vp, bp, mp, dop, lp,     \
-                                                  dlp, dqp, dkp, dvp, dbp, N, H, Sq, Sk, scale)    \
-                   : launch_bwd<DD, 32, 32, false>(stream, device, qp, kp, vp, bp, mp, dop, lp,    \
-                                                   dlp, dqp, dkp, dvp, dbp, N, H, Sq, Sk, scale);
+                   ? launch_bwd<DD, 32, 32, true>(stream, device, scratch, qp, kp, vp, bp, mp,    \
+                                                  dop, lp, dlp, dqp, dkp, dvp, dbp, N, H, Sq, Sk, \
+                                                  scale)                                           \
+                   : launch_bwd<DD, 32, 32, false>(stream, device, scratch, qp, kp, vp, bp, mp,   \
+                                                   dop, lp, dlp, dqp, dkp, dvp, dbp, N, H, Sq,   \
+                                                   Sk, scale);
     DISPATCH_BWD(8)
     DISPATCH_BWD(16)
     DISPATCH_BWD(32)
@@ -593,6 +487,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaMmaBwd, VoltaMmaBwdImpl,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>()
                                   .Ctx<ffi::DeviceOrdinal>()
+                                  .Ctx<ffi::ScratchAllocator>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
