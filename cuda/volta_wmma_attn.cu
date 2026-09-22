@@ -44,7 +44,7 @@ static bool needs_smem_optin(int device, const void* fn) {
     return true;
 }
 
-template <int D, int BQ, int BK>
+template <int D, int BQ, int BK, bool WANT_LSE>
 __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     const __half* __restrict__ bias, const uint8_t* __restrict__ kmask, __half* __restrict__ out,
@@ -228,9 +228,12 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     if (gq < Sq) {
         // softmax statistic, for the backward pass. Both lanes of a row hold
         // the same reduced m/l, so only one of them writes.
-        if (lse != nullptr && half_id == 0) {
-            const float l = ls[r_blk];
-            lse[(long long)(n * H + h) * Sq + gq] = (l > 0.f) ? (ms[r_blk] + log2f(l)) : -INFINITY;
+        if constexpr (WANT_LSE) {
+            if (half_id == 0) {
+                const float l = ls[r_blk];
+                lse[(long long)(n * H + h) * Sq + gq] =
+                    (l > 0.f) ? (ms[r_blk] + log2f(l)) : -INFINITY;
+            }
         }
         const float inv = 1.0f / fmaxf(ls[r_blk], 1e-30f);
         for (int c = half_id; c < DR; c += 2) {
@@ -239,7 +242,7 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     }
 }
 
-template <int D, int BQ, int BK>
+template <int D, int BQ, int BK, bool WANT_LSE>
 static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const __half* k,
                          const __half* v, const __half* bias, const uint8_t* kmask, __half* out,
                          float* lse, int N, int H, int Sq, int Sk, int DR, float scale) {
@@ -247,7 +250,7 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
     const size_t smem = (size_t)(BQ * SS_LD) * sizeof(float) +
                         (size_t)(BQ * PS_LD + 2 * BK * D) * sizeof(__half) +
                         (size_t)(BQ * D + 2 * BQ) * sizeof(float);
-    auto kern = volta_wmma_kernel<D, BQ, BK>;
+    auto kern = volta_wmma_kernel<D, BQ, BK, WANT_LSE>;
     const int max_smem = device_shared_limit(device);
     if ((int)smem > max_smem) {
         return ffi::Error::InvalidArgument("volta_wmma: needs " + std::to_string(smem / 1024) +
@@ -267,6 +270,7 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
     return ffi::Error::Success();
 }
 
+template <bool WANT_LSE>
 static ffi::Error volta_wmma_common(cudaStream_t stream, int32_t device,
                                     ffi::Buffer<ffi::DataType::F16> q,
                                     ffi::Buffer<ffi::DataType::F16> k,
@@ -289,8 +293,8 @@ static ffi::Error volta_wmma_common(cudaStream_t stream, int32_t device,
     __half* op = reinterpret_cast<__half*>(out->typed_data());
 #define DISPATCH_T(TILE, DD, BQ, BK)                                                               \
     if (D == (DD) && block_q == (BQ) && block_k == (BK))                                           \
-        return launch<TILE, BQ, BK>(stream, device, qp, kp, vp, bp, mp, op, lse, N, H, Sq, Sk,    \
-                                    (DD), scale);
+        return launch<TILE, BQ, BK, WANT_LSE>(stream, device, qp, kp, vp, bp, mp, op, lse, N, H, \
+                                              Sq, Sk, (DD), scale);
 #define DISPATCH(DD, BQ, BK) DISPATCH_T(DD, DD, BQ, BK)
     DISPATCH(32, 64, 64)
     DISPATCH(32, 64, 32)
@@ -309,8 +313,8 @@ ffi::Error VoltaWmmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::D
                          ffi::Buffer<ffi::DataType::F16> bias, ffi::Buffer<ffi::DataType::U8> kmask,
                          ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, float scale,
                          int64_t block_q, int64_t block_k) {
-    return volta_wmma_common(stream, device, q, k, v, bias, kmask, out, nullptr, scale, block_q,
-                             block_k);
+    return volta_wmma_common<false>(stream, device, q, k, v, bias, kmask, out, nullptr, scale,
+                                    block_q, block_k);
 }
 
 // Same kernel, one more result: the softmax statistic the backward needs.
@@ -323,8 +327,8 @@ ffi::Error VoltaWmmaFwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi
                             ffi::Result<ffi::Buffer<ffi::DataType::F16>> out,
                             ffi::Result<ffi::Buffer<ffi::DataType::F32>> lse, float scale,
                             int64_t block_q, int64_t block_k) {
-    return volta_wmma_common(stream, device, q, k, v, bias, kmask, out, lse->typed_data(), scale,
-                             block_q, block_k);
+    return volta_wmma_common<true>(stream, device, q, k, v, bias, kmask, out, lse->typed_data(),
+                                   scale, block_q, block_k);
 }
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmma, VoltaWmmaImpl,
