@@ -57,8 +57,7 @@ def fwd(q, k, v, bias, kmask, scale, bq=64, bk=32, want_lse=True):
           block_q=np.int64(bq), block_k=np.int64(bk), want_lse=want_lse)
 
 
-def bwd(q, k, v, bias, kmask, dout, lse, delta, scale, bq=64, bk=32,
-        want_dbias=True):
+def bwd(q, k, v, bias, kmask, dout, lse, delta, scale, want_dbias=True):
   n, h, sq, d = q.shape
   sk = k.shape[2]
   return jax.ffi.ffi_call(
@@ -69,7 +68,7 @@ def bwd(q, k, v, bias, kmask, dout, lse, delta, scale, bq=64, bk=32,
        jax.ShapeDtypeStruct((h, sq, sk), jnp.float32)),
       vmap_method='sequential')(
           q, k, v, bias, kmask, dout, lse, delta, scale=np.float32(scale),
-          block_q=np.int64(bq), block_k=np.int64(bk), want_dbias=want_dbias)
+          want_dbias=want_dbias)
 
 
 def reference(q, k, v, bias, kmask, scale):
@@ -84,8 +83,8 @@ def rel(a, b):
   a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
   if not np.isfinite(a).all():
     return float('inf')          # a NaN must never max() away behind a number
-  # A gradient can be exactly zero -- with one key the softmax is 1 whatever
-  # the logit is -- and zero has no relative scale, so floor the denominator.
+  # With one key the softmax is 1 whatever the logit is, so the gradient is
+  # exactly zero, and zero has no relative scale.
   denom = max(np.abs(b).max(), 1e-3)
   return float(np.abs(a - b).max() / denom)
 
@@ -117,7 +116,7 @@ def run(n=3, h=4, sq=96, sk=96, d=32, seed=0, bq=64, bk=32, kmask=None,
 
   out, lse = fwd(q, k, v, bias, km, scale, bq, bk)
   delta = jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32), -1)
-  dq, dk, dv, dbias = bwd(q, k, v, bias, km, dout, lse, delta, scale, bq, bk)
+  dq, dk, dv, dbias = bwd(q, k, v, bias, km, dout, lse, delta, scale)
 
   # lse comes back in the log2 domain, which is what the kernel's exp2 wants.
   ref_logits = scale * jnp.einsum('nhqd,nhkd->nhqk', qf, kf) + bf[None]
@@ -137,8 +136,8 @@ def run(n=3, h=4, sq=96, sk=96, d=32, seed=0, bq=64, bk=32, kmask=None,
 
 
 def try_run(**kwargs):
-  """None when this card cannot fit the tile, which is a limit, not a failure:
-  the wmma kernels are sized for Volta's 96 KB and a Turing card has 64 KB."""
+  """None when the card cannot fit the tile: the wmma kernels are sized for
+  Volta's 96 KB and a Turing card has 64 KB."""
   try:
     return run(**kwargs)
   except Exception as exc:                   # noqa: BLE001 - only the one case
@@ -166,7 +165,8 @@ def masked_rows_case():
 
 
 def coverage_case():
-  """Whatever block shape the forward takes, the backward must differentiate."""
+  """Whatever block shape the forward takes, the backward must differentiate:
+  it picks its own tiling from the head dim."""
   print('every forward (D, block_q, block_k)')
   bad = 0
   for d, bq, bk in FWD_CONFIGS[FAMILY]:

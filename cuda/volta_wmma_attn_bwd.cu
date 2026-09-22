@@ -89,7 +89,9 @@ __global__ __launch_bounds__(BQ / FRAG * WARP) void volta_wmma_bwd_dq_kernel(
     const int warp = threadIdx.x / WARP;
     const int tid = threadIdx.x;
 
-    const int qtile = blockIdx.x, h = blockIdx.y, n = blockIdx.z;
+    // n runs fastest, so the blocks sharing a dBias tile are resident together
+    // and their atomics stay in L2.
+    const int n = blockIdx.x, h = blockIdx.y, qtile = blockIdx.z;
     const int q0 = qtile * BQ;
     if (q0 >= Sq) {
         return;
@@ -423,7 +425,7 @@ static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, c
     if (smem_dq > 48 * 1024) {
         cudaFuncSetAttribute(kern_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_dq);
     }
-    dim3 grid_dq((Sq + BQ - 1) / BQ, H, N);
+    dim3 grid_dq(N, H, (Sq + BQ - 1) / BQ);
     kern_dq<<<grid_dq, (BQ / FRAG) * WARP, smem_dq, stream>>>(
         q, k, v, bias, kmask, dout, lse, delta, dq, dbias, N, H, Sq, Sk, DR, scale);
 
@@ -455,7 +457,7 @@ ffi::Error VoltaWmmaBwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi
                             ffi::Result<ffi::Buffer<ffi::DataType::F16>> dk,
                             ffi::Result<ffi::Buffer<ffi::DataType::F16>> dv,
                             ffi::Result<ffi::Buffer<ffi::DataType::F32>> dbias, float scale,
-                            int64_t block_q, int64_t block_k, bool want_dbias) {
+                            bool want_dbias) {
     auto d = q.dimensions();
     if (d.size() != 4) {
         return ffi::Error::InvalidArgument("q must be [N,H,S,D]");
@@ -472,10 +474,6 @@ ffi::Error VoltaWmmaBwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi
         return ffi::Error::InvalidArgument("volta_wmma_bwd: bias and dbias must be [H,Sq,Sk]");
     }
 
-    // The backward holds four tiles where the forward holds two, thus a tiling
-    // of its own: the requested blocks only pick the nearest one that fits.
-    const int64_t bq = block_q >= 64 ? 64 : 32;
-    const int64_t bk = block_k >= 64 ? 64 : 32;
     const __half* qp = reinterpret_cast<const __half*>(q.typed_data());
     const __half* kp = reinterpret_cast<const __half*>(k.typed_data());
     const __half* vp = reinterpret_cast<const __half*>(v.typed_data());
@@ -489,35 +487,24 @@ ffi::Error VoltaWmmaBwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi
     __half* dvp = reinterpret_cast<__half*>(dv->typed_data());
     float* dbp = reinterpret_cast<float*>(dbias->typed_data());
 
-#define DISPATCH_BWD_T(TILE, DD, BQ, BK)                                                           \
-    if (D == (DD) && bq == (BQ) && bk == (BK))                                                     \
-        return want_dbias ? launch_bwd<TILE, BQ, BK, true>(stream, device, qp, kp, vp, bp, mp,     \
+    // The backward holds four tiles where the forward holds two, thus a tiling
+    // of its own rather than the forward's: 32x32 measures best, except at head
+    // 64 where a 64-row query tile is a third faster. 63 KB at most.
+#define DISPATCH_BWD_T(TILE, DD, BQ)                                                               \
+    if (D == (DD))                                                                                 \
+        return want_dbias ? launch_bwd<TILE, BQ, 32, true>(stream, device, qp, kp, vp, bp, mp,     \
                                                            dop, lp, dlp, dqp, dkp, dvp, dbp, N,   \
                                                            H, Sq, Sk, (DD), scale)                 \
-                          : launch_bwd<TILE, BQ, BK, false>(stream, device, qp, kp, vp, bp, mp,    \
+                          : launch_bwd<TILE, BQ, 32, false>(stream, device, qp, kp, vp, bp, mp,    \
                                                             dop, lp, dlp, dqp, dkp, dvp, dbp, N,  \
                                                             H, Sq, Sk, (DD), scale);
-#define DISPATCH_BWD(DD, BQ, BK) DISPATCH_BWD_T(DD, DD, BQ, BK)
-    DISPATCH_BWD(16, 64, 64)
-    DISPATCH_BWD(16, 64, 32)
-    DISPATCH_BWD(16, 32, 64)
-    DISPATCH_BWD(16, 32, 32)
-    DISPATCH_BWD(32, 64, 64)
-    DISPATCH_BWD(32, 64, 32)
-    DISPATCH_BWD(32, 32, 64)
-    DISPATCH_BWD(32, 32, 32)
-    DISPATCH_BWD(64, 64, 64)
-    DISPATCH_BWD(64, 64, 32)
-    DISPATCH_BWD(64, 32, 64)
-    DISPATCH_BWD(64, 32, 32)
     // head 8 rides in a 16-wide tile, zero-padded, as it does in the forward.
-    DISPATCH_BWD_T(16, 8, 64, 64)
-    DISPATCH_BWD_T(16, 8, 64, 32)
-    DISPATCH_BWD_T(16, 8, 32, 64)
-    DISPATCH_BWD_T(16, 8, 32, 32)
-#undef DISPATCH_BWD
+    DISPATCH_BWD_T(16, 8, 32)
+    DISPATCH_BWD_T(16, 16, 32)
+    DISPATCH_BWD_T(32, 32, 32)
+    DISPATCH_BWD_T(64, 64, 64)
 #undef DISPATCH_BWD_T
-    return ffi::Error::InvalidArgument("volta_wmma_bwd: unsupported (D, bq, bk)");
+    return ffi::Error::InvalidArgument("volta_wmma_bwd: unsupported head dim");
 }
 
 // NOT kCmdBufferCompatible: this handler starts three kernels, and the first
@@ -539,6 +526,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmmaBwd, VoltaWmmaBwdImpl,
                                   .Ret<ffi::Buffer<ffi::DataType::F16>>()
                                   .Ret<ffi::Buffer<ffi::DataType::F32>>()
                                   .Attr<float>("scale")
-                                  .Attr<int64_t>("block_q")
-                                  .Attr<int64_t>("block_k")
                                   .Attr<bool>("want_dbias"));
