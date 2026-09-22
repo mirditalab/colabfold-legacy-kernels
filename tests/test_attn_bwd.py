@@ -8,6 +8,7 @@ be developed on an Ampere box and only confirmed on the T4 or V100 they are
 meant for.
 """
 import ctypes
+import functools
 import os
 import sys
 
@@ -83,7 +84,9 @@ def rel(a, b):
   a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
   if not np.isfinite(a).all():
     return float('inf')          # a NaN must never max() away behind a number
-  denom = max(np.abs(b).max(), 1e-6)
+  # A gradient can be exactly zero -- with one key the softmax is 1 whatever
+  # the logit is -- and zero has no relative scale, so floor the denominator.
+  denom = max(np.abs(b).max(), 1e-3)
   return float(np.abs(a - b).max() / denom)
 
 
@@ -181,6 +184,75 @@ def amplitude_case():
   return bad
 
 
+def tiny_case():
+  """Shapes below one block, including the Sq=1 template pointwise signature."""
+  print('shapes smaller than a block')
+  bad = 0
+  for sq, sk, d in ((1, 1, 16), (1, 4, 16), (7, 13, 16), (33, 1, 32), (3, 96, 8)):
+    worst = run(n=2, h=2, sq=sq, sk=sk, d=d, quiet=True)
+    flag = '' if worst < 0.05 else '  FAIL'
+    print(f'  sq={sq:4d} sk={sk:4d} D={d:3d}   worst {worst:.2e}{flag}')
+    bad += worst >= 0.05
+  print('  ->', 'OK' if not bad else f'FAIL ({bad})')
+  return bad
+
+
+def repeat_case():
+  """dQ/dK/dV are deterministic; dBias goes through atomics and need not be."""
+  print('repeated calls')
+  q, k, v, bias, km, dout = inputs(3, 4, 96, 96, 32, 0)
+  scale = 32.0 ** -0.5
+  out, lse = fwd(q, k, v, bias, km, scale)
+  delta = jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32), -1)
+  a = bwd(q, k, v, bias, km, dout, lse, delta, scale)
+  b = bwd(q, k, v, bias, km, dout, lse, delta, scale)
+  bad = 0
+  for name, x, y in zip(('dq', 'dk', 'dv'), a, b):
+    if not np.array_equal(np.asarray(x), np.asarray(y)):
+      print(f'  {name} differs between identical calls')
+      bad += 1
+  r = rel(a[3], b[3])
+  print(f'  dbias run-to-run rel {r:.2e} (atomics, so only bounded)')
+  bad += r >= 1e-3
+  print('  ->', 'OK' if not bad else f'FAIL ({bad})')
+  return bad
+
+
+def vjp_case():
+  """The kernels wired as a custom_vjp, against jax.grad of the reference."""
+  print('as a custom_vjp')
+  q, k, v, bias, km, dout = inputs(2, 4, 96, 96, 32, 0)
+  scale = 32.0 ** -0.5
+
+  @jax.custom_vjp
+  def fused(q, k, v, bias):
+    return fwd(q, k, v, bias, km, scale)[0]
+
+  def fused_fwd(q, k, v, bias):
+    out, lse = fwd(q, k, v, bias, km, scale)
+    return out, (q, k, v, bias, out, lse)
+
+  def fused_bwd(res, dout):
+    q, k, v, bias, out, lse = res
+    delta = jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32), -1)
+    dq, dk, dv, dbias = bwd(q, k, v, bias, km, dout, lse, delta, scale)
+    return dq, dk, dv, dbias.astype(bias.dtype)
+
+  fused.defvjp(fused_fwd, fused_bwd)
+  loss = lambda f, *a: jnp.sum(f(*a).astype(jnp.float32) * dout.astype(jnp.float32))
+  got = jax.grad(loss, argnums=(1, 2, 3, 4))(fused, q, k, v, bias)
+  ref_f = lambda a, b, c, e: reference(a, b, c, e, km, scale)
+  want = jax.grad(loss, argnums=(1, 2, 3, 4))(
+      ref_f, *[x.astype(jnp.float32) for x in (q, k, v, bias)])
+  bad = 0
+  for name, g, r in zip(('dq', 'dk', 'dv', 'dbias'), got, want):
+    rr = rel(g, r)
+    bad += rr >= 0.05
+    print(f'  {name:6s} rel {rr:.2e}')
+  print('  ->', 'OK' if not bad else f'FAIL ({bad})')
+  return bad
+
+
 def want_flags_case():
   """want_lse and want_dbias only drop results, they never change the rest."""
   print('want_lse / want_dbias off')
@@ -223,6 +295,9 @@ if __name__ == '__main__':
   bad += masked_rows_case()
   bad += coverage_case()
   bad += amplitude_case()
+  bad += tiny_case()
+  bad += repeat_case()
+  bad += vjp_case()
   bad += want_flags_case()
   print('RESULT:', 'PASS' if not bad else f'FAIL ({bad})')
   sys.exit(0 if not bad else 1)
