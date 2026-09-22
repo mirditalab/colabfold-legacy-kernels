@@ -13,7 +13,6 @@
 namespace ffi = xla::ffi;
 using namespace nvcuda;
 
-#define WARP 32
 #define FRAG 16
 
 #define MAX_DEVICES 16

@@ -1,6 +1,9 @@
 // Constants the attention units share; forward and backward must agree on them.
 #pragma once
 
+// Threads per warp.
+#define WARP 32
+
 // A masked logit, matching AlphaFold's float16 mask bias. -inf would leave
 // inf - inf on an all-masked row.
 #define MASKED_LOGIT (-1.0e4f)
