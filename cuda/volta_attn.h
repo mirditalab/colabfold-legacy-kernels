@@ -7,3 +7,4 @@
 
 // The softmax runs in the log2 domain, where exp2 is one instruction.
 #define LOG2E 1.4426950408889634f
+

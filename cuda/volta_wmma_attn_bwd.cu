@@ -401,10 +401,12 @@ static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, c
                              int DR, float scale) {
     constexpr int DQ_SS = (BK > D ? BK : D) + 4;
     constexpr int DKDV_SS = (BQ > D ? BQ : D) + 4;
-    const size_t smem_dq = (size_t)(2 * BQ * DQ_SS) * sizeof(float) +
-                           (size_t)(BQ * (BK + 8) + 2 * BQ * D + 2 * BK * D) * sizeof(__half);
-    const size_t smem_dkdv = (size_t)(2 * BK * DKDV_SS) * sizeof(float) +
-                             (size_t)(2 * BK * (BQ + 8) + 2 * BK * D + 2 * BQ * D) * sizeof(__half);
+    constexpr size_t smem_dq =
+        (size_t)(2 * BQ * DQ_SS) * sizeof(float) +
+        (size_t)(BQ * (BK + 8) + 2 * BQ * D + 2 * BK * D) * sizeof(__half);
+    constexpr size_t smem_dkdv =
+        (size_t)(2 * BK * DKDV_SS) * sizeof(float) +
+        (size_t)(2 * BK * (BQ + 8) + 2 * BK * D + 2 * BQ * D) * sizeof(__half);
     const int max_smem = bwd_shared_limit(device);
     const size_t need = smem_dq > smem_dkdv ? smem_dq : smem_dkdv;
     if ((int)need > max_smem) {

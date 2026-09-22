@@ -293,7 +293,7 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
                          const __half* v, const __half* bias, const uint8_t* kmask, __half* out,
                          float* lse, int N, int H, int Sq, int Sk, float scale) {
     constexpr int NWARP = BQ / MMA_M;
-    const size_t smem = (size_t)(BQ * D + 2 * BK * D + BQ * BK) * sizeof(__half);
+    constexpr size_t smem = (size_t)(BQ * D + 2 * BK * D + BQ * BK) * sizeof(__half);
     auto kern = volta_mma_kernel<D, BQ, BK, WANT_LSE>;
 
     // Read the device limit one time only.

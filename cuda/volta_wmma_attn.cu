@@ -247,9 +247,9 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
                          const __half* v, const __half* bias, const uint8_t* kmask, __half* out,
                          float* lse, int N, int H, int Sq, int Sk, int DR, float scale) {
     constexpr int SS_LD = (BK > D ? BK : D) + 4, PS_LD = BK + 8;
-    const size_t smem = (size_t)(BQ * SS_LD) * sizeof(float) +
-                        (size_t)(BQ * PS_LD + 2 * BK * D) * sizeof(__half) +
-                        (size_t)(BQ * D + 2 * BQ) * sizeof(float);
+    constexpr size_t smem = (size_t)(BQ * SS_LD) * sizeof(float) +
+                            (size_t)(BQ * PS_LD + 2 * BK * D) * sizeof(__half) +
+                            (size_t)(BQ * D + 2 * BQ) * sizeof(float);
     auto kern = volta_wmma_kernel<D, BQ, BK, WANT_LSE>;
     const int max_smem = device_shared_limit(device);
     if ((int)smem > max_smem) {
