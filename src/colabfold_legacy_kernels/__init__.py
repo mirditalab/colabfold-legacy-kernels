@@ -23,12 +23,12 @@ _TABLE = {
         (75, "libvolta_mma.so", "VoltaMma"),
         (70, "libvolta_wmma.so", "VoltaWmma"),
     ),
-    "layer_norm": (
-        (70, "libvolta_ops.so", "VoltaLayerNorm"),
-    ),
     "attention_bwd": (
         (75, "libvolta_mma_bwd.so", "VoltaMmaBwd"),
         (70, "libvolta_wmma_bwd.so", "VoltaWmmaBwd"),
+    ),
+    "layer_norm": (
+        (70, "libvolta_ops.so", "VoltaLayerNorm"),
     ),
     "gated_dual_proj": (
         (75, "libvolta_ops.so", "VoltaGdp"),
@@ -37,9 +37,6 @@ _TABLE = {
 }
 
 KERNELS = tuple(_TABLE)
-# available() defaults to these, so a wheel built before the backward existed
-# and one built after both answer the same question.
-_FORWARD_KERNELS = ("attention", "layer_norm", "gated_dual_proj")
 
 
 def supported_capabilities():
@@ -90,7 +87,7 @@ def symbol(kernel, cc):
 
 def available(cc, kernel=None):
     """Tell if the kernels are present. With kernel=None, test all of them."""
-    names = _FORWARD_KERNELS if kernel is None else (kernel,)
+    names = KERNELS if kernel is None else (kernel,)
     for name in names:
         try:
             library_path(name, cc)
