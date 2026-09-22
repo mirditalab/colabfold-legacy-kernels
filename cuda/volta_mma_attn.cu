@@ -67,7 +67,7 @@ using FragC = cutlass::Array<float, 4>;
 
 // BQ must be a multiple of 16 (one warp owns MMA_M=16 query rows).
 // BK and D must be multiples of 8.
-template <int D, int BQ, int BK>
+template <int D, int BQ, int BK, bool WANT_LSE>
 __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     const __half* __restrict__ bias, const uint8_t* __restrict__ kmask, __half* __restrict__ out,
@@ -255,14 +255,16 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
 
     // softmax statistic, for the backward pass. Every lane of a row group
     // holds the same reduced l_run/m_run, so one lane per group writes.
-    if (lse != nullptr && (lane & 3) == 0) {
+    if constexpr (WANT_LSE) {
+        if ((lane & 3) == 0) {
 #pragma unroll
-        for (int half_i = 0; half_i < 2; ++half_i) {
-            const int gq = (half_i == 0) ? row_a : row_b;
-            if (gq < Sq) {
-                const float l = l_run[half_i];
-                lse[(long long)(n * H + h) * Sq + gq] =
-                    (l > 0.f) ? (m_run[half_i] + log2f(l)) : -INFINITY;
+            for (int half_i = 0; half_i < 2; ++half_i) {
+                const int gq = (half_i == 0) ? row_a : row_b;
+                if (gq < Sq) {
+                    const float l = l_run[half_i];
+                    lse[(long long)(n * H + h) * Sq + gq] =
+                        (l > 0.f) ? (m_run[half_i] + log2f(l)) : -INFINITY;
+                }
             }
         }
     }
@@ -287,13 +289,13 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
 }
 
 //
-template <int D, int BQ, int BK>
+template <int D, int BQ, int BK, bool WANT_LSE>
 static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const __half* k,
                          const __half* v, const __half* bias, const uint8_t* kmask, __half* out,
                          float* lse, int N, int H, int Sq, int Sk, float scale) {
     constexpr int NWARP = BQ / MMA_M;
     const size_t smem = (size_t)(BQ * D + 2 * BK * D + BQ * BK) * sizeof(__half);
-    auto kern = volta_mma_kernel<D, BQ, BK>;
+    auto kern = volta_mma_kernel<D, BQ, BK, WANT_LSE>;
 
     // Read the device limit one time only.
     // The handler must do no host work, or XLA cannot put it in a CUDA graph.
@@ -316,6 +318,7 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
     return ffi::Error::Success();
 }
 
+template <bool WANT_LSE>
 static ffi::Error volta_mma_common(cudaStream_t stream, int32_t device,
                                    ffi::Buffer<ffi::DataType::F16> q,
                                    ffi::Buffer<ffi::DataType::F16> k,
@@ -339,8 +342,8 @@ static ffi::Error volta_mma_common(cudaStream_t stream, int32_t device,
 
 #define DISPATCH(DD, BQ, BK)                                                                       \
     if (D == (DD) && block_q == (BQ) && block_k == (BK))                                           \
-        return launch<DD, BQ, BK>(stream, device, qp, kp, vp, bp, mp, op, lse, N, H, Sq, Sk,      \
-                                  scale);
+        return launch<DD, BQ, BK, WANT_LSE>(stream, device, qp, kp, vp, bp, mp, op, lse, N, H,   \
+                                            Sq, Sk, scale);
     DISPATCH(8, 64, 64)
     DISPATCH(8, 64, 32)
     DISPATCH(8, 32, 32)
@@ -352,47 +355,24 @@ static ffi::Error volta_mma_common(cudaStream_t stream, int32_t device,
                     return ffi::Error::InvalidArgument("volta_mma: unsupported (D, bq, bk)");
 }
 
+// lse is the softmax statistic the backward needs. A caller that only infers
+// passes want_lse false: the store compiles out of the kernel it picks, and the
+// buffer is never touched, so hand in a one-element dummy rather than [N,H,Sq].
 ffi::Error VoltaMmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
                         ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
                         ffi::Buffer<ffi::DataType::F16> bias, ffi::Buffer<ffi::DataType::U8> kmask,
-                        ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, float scale,
-                        int64_t block_q, int64_t block_k) {
-    return volta_mma_common(stream, device, q, k, v, bias, kmask, out, nullptr, scale, block_q,
-                            block_k);
+                        ffi::Result<ffi::Buffer<ffi::DataType::F16>> out,
+                        ffi::Result<ffi::Buffer<ffi::DataType::F32>> lse, float scale,
+                        int64_t block_q, int64_t block_k, bool want_lse) {
+    if (want_lse) {
+        return volta_mma_common<true>(stream, device, q, k, v, bias, kmask, out,
+                                      lse->typed_data(), scale, block_q, block_k);
+    }
+    return volta_mma_common<false>(stream, device, q, k, v, bias, kmask, out, nullptr, scale,
+                                   block_q, block_k);
 }
 
-// Same kernel, one more result: the softmax statistic the backward needs.
-// A separate symbol rather than a second Ret on VoltaMma, so a wheel with this
-// in it still drives every caller written against the original ABI.
-ffi::Error VoltaMmaFwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
-                           ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
-                           ffi::Buffer<ffi::DataType::F16> bias,
-                           ffi::Buffer<ffi::DataType::U8> kmask,
-                           ffi::Result<ffi::Buffer<ffi::DataType::F16>> out,
-                           ffi::Result<ffi::Buffer<ffi::DataType::F32>> lse, float scale,
-                           int64_t block_q, int64_t block_k) {
-    return volta_mma_common(stream, device, q, k, v, bias, kmask, out, lse->typed_data(), scale,
-                            block_q, block_k);
-}
-
-// kCmdBufferCompatible lets XLA put this call in a CUDA graph.
-// This is correct because the handler only starts one kernel on the XLA stream.
 XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaMma, VoltaMmaImpl,
-                              ffi::Ffi::Bind()
-                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
-                                  .Ctx<ffi::DeviceOrdinal>()
-                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Arg<ffi::Buffer<ffi::DataType::U8>>()
-                                  .Ret<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Attr<float>("scale")
-                                  .Attr<int64_t>("block_q")
-                                  .Attr<int64_t>("block_k"),
-                              {ffi::Traits::kCmdBufferCompatible});
-
-XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaMmaFwd, VoltaMmaFwdImpl,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>()
                                   .Ctx<ffi::DeviceOrdinal>()
@@ -405,5 +385,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaMmaFwd, VoltaMmaFwdImpl,
                                   .Ret<ffi::Buffer<ffi::DataType::F32>>()
                                   .Attr<float>("scale")
                                   .Attr<int64_t>("block_q")
-                                  .Attr<int64_t>("block_k"),
+                                  .Attr<int64_t>("block_k")
+                                  .Attr<bool>("want_lse"),
                               {ffi::Traits::kCmdBufferCompatible});
