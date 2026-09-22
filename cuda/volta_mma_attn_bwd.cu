@@ -339,6 +339,29 @@ __global__ __launch_bounds__(BK / MMA_M * WARP) void volta_mma_bwd_fused_kernel(
     }
 }
 
+// delta_i = sum_c out_ic * dout_ic, the row statistic the backward subtracts.
+// One warp per row, so the reads coalesce.
+static __global__ void row_delta(const __half* __restrict__ out,
+                                 const __half* __restrict__ dout, float* __restrict__ delta,
+                                 long long rows, int DR) {
+    const long long row = (long long)blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
+    if (row >= rows) {
+        return;
+    }
+    const int lane = threadIdx.x & (WARP - 1);
+    float s = 0.f;
+    for (int c = lane; c < DR; c += WARP) {
+        s += __half2float(out[row * DR + c]) * __half2float(dout[row * DR + c]);
+    }
+#pragma unroll
+    for (int off = WARP / 2; off > 0; off >>= 1) {
+        s += __shfl_down_sync(0xffffffffu, s, off);
+    }
+    if (lane == 0) {
+        delta[row] = s;
+    }
+}
+
 static __global__ void to_half(const float* __restrict__ src, __half* __restrict__ dst,
                                long long n) {
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -376,7 +399,7 @@ template <int D, int BQ, int BK, bool WANT_DBIAS>
 static ffi::Error launch_bwd(cudaStream_t stream, int device, ffi::ScratchAllocator& scratch,
                              const __half* q, const __half* k, const __half* v,
                              const __half* bias, const uint8_t* kmask, const __half* dout,
-                             const float* lse, const float* delta, __half* dq, __half* dk,
+                             const float* lse, const __half* out, __half* dq, __half* dk,
                              __half* dv, float* dbias, int N, int H, int Sq, int Sk, float scale) {
     constexpr size_t smem = (size_t)(2 * BK * D + 2 * BQ * D + BK * BQ + BK * (BQ + 8)) *
                                 sizeof(__half) +
@@ -397,6 +420,14 @@ static ffi::Error launch_bwd(cudaStream_t stream, int device, ffi::ScratchAlloca
     }
     float* dq_accum = reinterpret_cast<float*>(*mem);
     zero_f32<<<256, 256, 0, stream>>>(dq_accum, nq);
+
+    const long long rows = (long long)N * H * Sq;
+    auto dmem = scratch.Allocate(rows * sizeof(float), alignof(float));
+    if (!dmem.has_value()) {
+        return ffi::Error::Internal("volta_mma_bwd: no scratch for the row statistic");
+    }
+    float* delta = reinterpret_cast<float*>(*dmem);
+    row_delta<<<(unsigned)((rows + 7) / 8), 256, 0, stream>>>(out, dout, delta, rows, D);
     zero_f32<<<256, 256, 0, stream>>>(dbias, (long long)H * Sq * Sk);
 
     auto kern = volta_mma_bwd_fused_kernel<D, BK, BQ, WANT_DBIAS>;
@@ -424,9 +455,9 @@ ffi::Error VoltaMmaBwdImpl(cudaStream_t stream, int32_t device, ffi::ScratchAllo
                            ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
                            ffi::Buffer<ffi::DataType::F16> bias,
                            ffi::Buffer<ffi::DataType::U8> kmask,
+                           ffi::Buffer<ffi::DataType::F16> out,
                            ffi::Buffer<ffi::DataType::F16> dout,
                            ffi::Buffer<ffi::DataType::F32> lse,
-                           ffi::Buffer<ffi::DataType::F32> delta,
                            ffi::Result<ffi::Buffer<ffi::DataType::F16>> dq,
                            ffi::Result<ffi::Buffer<ffi::DataType::F16>> dk,
                            ffi::Result<ffi::Buffer<ffi::DataType::F16>> dv,
@@ -441,8 +472,11 @@ ffi::Error VoltaMmaBwdImpl(cudaStream_t stream, int32_t device, ffi::ScratchAllo
     if (!same_shape(v, k) || !same_shape(dout, q)) {
         return ffi::Error::InvalidArgument("volta_mma_bwd: v must match k, dout must match q");
     }
-    if (!rows_are(lse, N, H, Sq) || !rows_are(delta, N, H, Sq)) {
-        return ffi::Error::InvalidArgument("volta_mma_bwd: lse and delta must be [N,H,Sq]");
+    if (!rows_are(lse, N, H, Sq)) {
+        return ffi::Error::InvalidArgument("volta_mma_bwd: lse must be [N,H,Sq]");
+    }
+    if (!same_shape(out, q)) {
+        return ffi::Error::InvalidArgument("volta_mma_bwd: out must match q");
     }
     if (!bias_is(bias, H, Sq, Sk) || !bias_is(*dbias, H, Sq, Sk)) {
         return ffi::Error::InvalidArgument("volta_mma_bwd: bias and dbias must be [H,Sq,Sk]");
@@ -455,7 +489,7 @@ ffi::Error VoltaMmaBwdImpl(cudaStream_t stream, int32_t device, ffi::ScratchAllo
     const uint8_t* mp = kmask.typed_data();
     const __half* dop = reinterpret_cast<const __half*>(dout.typed_data());
     const float* lp = lse.typed_data();
-    const float* dlp = delta.typed_data();
+    const __half* outp = reinterpret_cast<const __half*>(out.typed_data());
     __half* dqp = reinterpret_cast<__half*>(dq->typed_data());
     __half* dkp = reinterpret_cast<__half*>(dk->typed_data());
     __half* dvp = reinterpret_cast<__half*>(dv->typed_data());
@@ -468,10 +502,10 @@ ffi::Error VoltaMmaBwdImpl(cudaStream_t stream, int32_t device, ffi::ScratchAllo
     if (D == (DD))                                                                                 \
         return want_dbias                                                                          \
                    ? launch_bwd<DD, 32, 32, true>(stream, device, scratch, qp, kp, vp, bp, mp,    \
-                                                  dop, lp, dlp, dqp, dkp, dvp, dbp, N, H, Sq, Sk, \
+                                                  dop, lp, outp, dqp, dkp, dvp, dbp, N, H, Sq, Sk, \
                                                   scale)                                           \
                    : launch_bwd<DD, 32, 32, false>(stream, device, scratch, qp, kp, vp, bp, mp,   \
-                                                   dop, lp, dlp, dqp, dkp, dvp, dbp, N, H, Sq,   \
+                                                   dop, lp, outp, dqp, dkp, dvp, dbp, N, H, Sq,   \
                                                    Sk, scale);
     DISPATCH_BWD(8)
     DISPATCH_BWD(16)
@@ -494,7 +528,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaMmaBwd, VoltaMmaBwdImpl,
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::U8>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
-                                  .Arg<ffi::Buffer<ffi::DataType::F32>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F32>>()
                                   .Ret<ffi::Buffer<ffi::DataType::F16>>()
                                   .Ret<ffi::Buffer<ffi::DataType::F16>>()
