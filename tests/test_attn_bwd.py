@@ -299,6 +299,40 @@ def vjp_case():
   return bad
 
 
+def xla_case():
+  """Against the path that runs when the kernels are off. float64 is truth, so
+  this says whether the kernel is at least as close to it as XLA in half is."""
+  print('against the unfused XLA path')
+  bad = 0
+  for n, h, sq, sk, d in ((2, 4, 96, 96, 32), (2, 4, 70, 83, 16), (1, 8, 128, 128, 64)):
+    q, k, v, bias, km, dout = inputs(n, h, sq, sk, d, 0)
+    scale = float(d) ** -0.5
+    truth = reference_grads(q, k, v, bias, km, dout, scale)
+
+    def loss(a, b, c, e):
+      out = reference(a, b, c, e, km, scale)
+      return jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32))
+
+    xla = {}
+    for tag, dt in (('half', jnp.float16), ('float32', jnp.float32)):
+      args = [x.astype(dt) for x in (q, k, v, bias)]
+      xla[tag] = (reference(*args, km, scale),) + jax.grad(loss, argnums=(0, 1, 2, 3))(*args)
+
+    # 32x32 is the one forward tiling every head dim has
+    out, lse = fwd(q, k, v, bias, km, scale, 32, 32)
+    ours = (out,) + bwd(q, k, v, bias, km, dout, lse, row_delta(out, dout), scale)
+    names = ('out', 'dq', 'dk', 'dv', 'dbias')
+    want = (truth[0],) + truth[2:]
+    print(f'    n={n} h={h} sq={sq} sk={sk} D={d}')
+    for i, name in enumerate(names):
+      ro, rh, rf = (rel(x[i], want[i]) for x in (ours, xla['half'], xla['float32']))
+      flag = '' if ro <= max(rh * 2, 1e-3) else '   WORSE THAN HALF XLA'
+      bad += bool(flag)
+      print(f'      {name:6s} ours {ro:.2e}   xla half {rh:.2e}   xla float32 {rf:.2e}{flag}')
+  print('  ->', 'OK' if not bad else f'FAIL ({bad})')
+  return bad
+
+
 def want_flags_case():
   """want_lse and want_dbias only drop results, they never change the rest."""
   print('want_lse / want_dbias off')
@@ -344,6 +378,7 @@ if __name__ == '__main__':
   bad += tiny_case()
   bad += repeat_case()
   bad += vjp_case()
+  bad += xla_case()
   bad += want_flags_case()
   print('RESULT:', 'PASS' if not bad else f'FAIL ({bad})')
   sys.exit(0 if not bad else 1)
