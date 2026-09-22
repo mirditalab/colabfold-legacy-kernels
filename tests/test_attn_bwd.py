@@ -45,7 +45,7 @@ def register():
 
 def fwd(q, k, v, bias, kmask, scale, bq=64, bk=32, want_lse=True):
   n, h, sq, d = q.shape
-  # an inference caller asks for a dummy lse, which the kernel never writes
+  # want_lse false leaves the buffer untouched, so one element is enough
   lse_shape = (n, h, sq) if want_lse else (1,)
   return jax.ffi.ffi_call(
       'VoltaMma' if FAMILY == 'mma' else 'VoltaWmma',
@@ -87,21 +87,22 @@ def rel(a, b):
   return float(np.abs(a - b).max() / denom)
 
 
-def inputs(n, h, sq, sk, d, seed, masked_rows=0.15):
+def inputs(n, h, sq, sk, d, seed, masked_rows=0.15, qk_amp=0.5, vo_amp=0.5):
   ks = jax.random.split(jax.random.PRNGKey(seed), 6)
   f16 = lambda x: x.astype(jnp.float16)
-  q = f16(jax.random.normal(ks[0], (n, h, sq, d)) * 0.5)
-  k = f16(jax.random.normal(ks[1], (n, h, sk, d)) * 0.5)
-  v = f16(jax.random.normal(ks[2], (n, h, sk, d)) * 0.5)
-  bias = f16(jax.random.normal(ks[3], (h, sq, sk)) * 0.5)
+  q = f16(jax.random.normal(ks[0], (n, h, sq, d)) * qk_amp)
+  k = f16(jax.random.normal(ks[1], (n, h, sk, d)) * qk_amp)
+  v = f16(jax.random.normal(ks[2], (n, h, sk, d)) * vo_amp)
+  bias = f16(jax.random.normal(ks[3], (h, sq, sk)) * qk_amp)
   kmask = (jax.random.uniform(ks[4], (n, sk)) > masked_rows).astype(jnp.uint8)
-  dout = f16(jax.random.normal(ks[5], (n, h, sq, d)) * 0.5)
+  dout = f16(jax.random.normal(ks[5], (n, h, sq, d)) * vo_amp)
   return q, k, v, bias, kmask, dout
 
 
 def run(n=3, h=4, sq=96, sk=96, d=32, seed=0, bq=64, bk=32, kmask=None,
-        quiet=False):
-  q, k, v, bias, km, dout = inputs(n, h, sq, sk, d, seed)
+        quiet=False, qk_amp=0.5, vo_amp=0.5):
+  q, k, v, bias, km, dout = inputs(n, h, sq, sk, d, seed, qk_amp=qk_amp,
+                                   vo_amp=vo_amp)
   if kmask is not None:
     km = kmask
   scale = float(d) ** -0.5
@@ -166,6 +167,20 @@ def coverage_case():
   return bad
 
 
+def amplitude_case():
+  """Activations near the fp16 ceiling: dS must not overflow the half it is
+  stored in, and the clamp must stay below the logits it hides."""
+  print('large activations')
+  bad = 0
+  for qk, vo in ((0.5, 32.0), (0.5, 90.0), (16.0, 0.5), (32.0, 0.5)):
+    worst = run(n=2, h=2, d=64, bk=64, qk_amp=qk, vo_amp=vo, quiet=True)
+    flag = '' if worst < 0.05 else '  FAIL'
+    print(f'  qk x{qk:5.1f}  v/dO x{vo:5.1f}   worst {worst:.2e}{flag}')
+    bad += worst >= 0.05
+  print('  ->', 'OK' if not bad else f'FAIL ({bad})')
+  return bad
+
+
 def want_flags_case():
   """want_lse and want_dbias only drop results, they never change the rest."""
   print('want_lse / want_dbias off')
@@ -207,6 +222,7 @@ if __name__ == '__main__':
     bad += check(str(kwargs), run(**kwargs))
   bad += masked_rows_case()
   bad += coverage_case()
+  bad += amplitude_case()
   bad += want_flags_case()
   print('RESULT:', 'PASS' if not bad else f'FAIL ({bad})')
   sys.exit(0 if not bad else 1)

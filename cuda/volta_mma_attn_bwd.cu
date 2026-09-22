@@ -45,6 +45,7 @@
 #include "cutlass/numeric_types.h"
 #include "cutlass/array.h"
 
+#include "volta_attn.h"
 #include "xla/ffi/api/ffi.h"
 
 namespace ffi = xla::ffi;
@@ -53,8 +54,6 @@ namespace ffi = xla::ffi;
 #define MMA_M 16
 #define MMA_N 8
 #define MMA_K 8
-#define LOG2E 1.4426950408889634f
-#define NEG_F16 (-1.0e4f)
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 750)
 #error "volta_mma_attn_bwd.cu requires sm_75+."
@@ -70,25 +69,6 @@ static int bwd_shared_limit(int device) {
         cudaDeviceGetAttribute(&cache[device], cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     }
     return cache[device];
-}
-
-// Keyed by kernel, because the two backward kernels alternate on one device.
-#define MAX_KERNELS 8
-static bool bwd_needs_optin(int device, const void* fn) {
-    static const void* cache[MAX_DEVICES][MAX_KERNELS] = {};
-    if (device < 0 || device >= MAX_DEVICES) {
-        return true;
-    }
-    for (int i = 0; i < MAX_KERNELS; ++i) {
-        if (cache[device][i] == fn) {
-            return false;
-        }
-        if (cache[device][i] == nullptr) {
-            cache[device][i] = fn;
-            return true;
-        }
-    }
-    return true;
 }
 
 using MmaOp =
@@ -236,13 +216,13 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_bwd_dq_kernel(
                     const int r_loc = warp * MMA_M + lr + half_i * 8;
                     const int gq = q0 + r_loc;
                     const int gk = k0 + nt * MMA_N + lc + j;
-                    // the clamped logit the forward used, so a row with every key
-                    // masked differentiates the uniform softmax it was given
+                    // the forward's clamped logit, so an all-masked row
+                    // differentiates the uniform softmax it was given
                     const bool live = gq < Sq && gk < Sk && kmask[(long long)n * Sk + gk] != 0;
                     const float l2 =
                         live ? (s[nt][idx] * qk_scale +
                                 __half2float(Bs[r_loc * BK + nt * MMA_N + lc + j]) * LOG2E)
-                             : (NEG_F16 * LOG2E);
+                             : (MASKED_LOGIT * LOG2E);
                     const float p = exp2f(l2 - lse_r[half_i]);
                     // a masked logit is a constant, so nothing flows back to q,
                     // k or the bias through it
@@ -426,7 +406,7 @@ __global__ __launch_bounds__(BK / MMA_M * WARP) void volta_mma_bwd_dkdv_kernel(
                     const bool alive = live[half_i] && gq < Sq;
                     const float l2 = alive ? (st[nt][idx] * qk_scale +
                                               __half2float(Bs[k_loc * BQ + q_loc]) * LOG2E)
-                                           : (NEG_F16 * LOG2E);
+                                           : (MASKED_LOGIT * LOG2E);
                     // P carries dV even where the mask clamped the logit, but dS
                     // does not: a constant logit has no gradient
                     const float p = exp2f(l2 - Ls[q_loc]);
@@ -517,13 +497,12 @@ static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, c
                                            std::to_string(max_smem / 1024) + " KB");
     }
 
-    // dBias accumulates, thus it starts at zero. A caller that does not want it
-    // still gets zeros rather than whatever the buffer held.
+    // dBias accumulates, thus it starts at zero, and stays zero when unwanted.
     const long long nb = (long long)H * Sq * Sk;
     zero_f32<<<256, 256, 0, stream>>>(dbias, nb);
 
     auto kern_dq = volta_mma_bwd_dq_kernel<D, BQ, BK, WANT_DBIAS>;
-    if (smem_dq > 48 * 1024 && bwd_needs_optin(device, (const void*)kern_dq)) {
+    if (smem_dq > 48 * 1024) {
         cudaFuncSetAttribute(kern_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_dq);
     }
     dim3 grid_dq((Sq + BQ - 1) / BQ, H, N);
@@ -531,7 +510,7 @@ static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, c
         q, k, v, bias, kmask, dout, lse, delta, dq, dbias, N, H, Sq, Sk, scale);
 
     auto kern_dkdv = volta_mma_bwd_dkdv_kernel<D, BK, BQ>;
-    if (smem_dkdv > 48 * 1024 && bwd_needs_optin(device, (const void*)kern_dkdv)) {
+    if (smem_dkdv > 48 * 1024) {
         cudaFuncSetAttribute(kern_dkdv, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)smem_dkdv);
     }
@@ -575,8 +554,8 @@ ffi::Error VoltaMmaBwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi:
         return ffi::Error::InvalidArgument("volta_mma_bwd: bias and dbias must be [H,Sq,Sk]");
     }
 
-    // The forward tunes its blocks freely; the backward holds four tiles where
-    // the forward holds two, so it takes the nearest tiling it can fit.
+    // The backward holds four tiles where the forward holds two, thus a tiling
+    // of its own: the requested blocks only pick the nearest one it has.
     const int64_t bq = block_q >= 64 ? 64 : 32;
     const int64_t bk = block_k >= 64 ? 64 : 32;
     const __half* qp = reinterpret_cast<const __half*>(q.typed_data());

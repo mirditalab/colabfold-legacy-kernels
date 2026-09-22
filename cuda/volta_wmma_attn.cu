@@ -7,6 +7,7 @@
 #include <mma.h>
 #include <cstdint>
 #include <string>
+#include "volta_attn.h"
 #include "xla/ffi/api/ffi.h"
 
 namespace ffi = xla::ffi;
@@ -14,8 +15,6 @@ using namespace nvcuda;
 
 #define WARP 32
 #define FRAG 16
-#define NEG_F16 (-1.0e4f)
-#define LOG2E 1.4426950408889634f
 
 #define MAX_DEVICES 16
 
@@ -172,7 +171,7 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
             const int gk = k0 + c;
             float s;
             if (!row_ok || gk >= Sk || kmask[(long long)n * Sk + gk] == 0) {
-                s = NEG_F16 * LOG2E;
+                s = MASKED_LOGIT * LOG2E;
             } else {
                 s = Ss[r_blk * SS_LD + c] * qk_scale +
                     __half2float(bias[bh + (long long)gq * Sk + gk]) * LOG2E;
@@ -309,9 +308,8 @@ static ffi::Error volta_wmma_common(cudaStream_t stream, int32_t device,
                 return ffi::Error::InvalidArgument("volta_wmma: unsupported (D, bq, bk)");
 }
 
-// lse is the softmax statistic the backward needs. A caller that only infers
-// passes want_lse false: the store compiles out of the kernel it picks, and the
-// buffer is never touched, so hand in a one-element dummy rather than [N,H,Sq].
+// lse is the softmax statistic the backward needs. With want_lse false the
+// store compiles out and the buffer goes untouched, so one element is enough.
 ffi::Error VoltaWmmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::DataType::F16> q,
                          ffi::Buffer<ffi::DataType::F16> k, ffi::Buffer<ffi::DataType::F16> v,
                          ffi::Buffer<ffi::DataType::F16> bias, ffi::Buffer<ffi::DataType::U8> kmask,
