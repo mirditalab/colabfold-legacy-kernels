@@ -100,7 +100,7 @@ __global__ __launch_bounds__(BK / MMA_M * WARP) void volta_mma_bwd_fused_kernel(
     const __half* __restrict__ dout, const float* __restrict__ lse,
     const float* __restrict__ delta, float* __restrict__ dq_accum, __half* __restrict__ dk,
     __half* __restrict__ dv, float* __restrict__ dbias, int N, int H, int Sq, int Sk,
-    float sm_scale) {
+    float sm_scale, bool n_fastest) {
     constexpr int NWARP = BK / MMA_M;
     constexpr int NQ = BQ / MMA_N;
     constexpr int ND = D / MMA_N;
@@ -113,7 +113,12 @@ __global__ __launch_bounds__(BK / MMA_M * WARP) void volta_mma_bwd_fused_kernel(
     const int tid = threadIdx.x;
     const int nthreads = NWARP * WARP;
 
-    const int ktile = blockIdx.x, h = blockIdx.y, n = blockIdx.z;
+    // The bias tile is shared across the batch and is the largest thing read, so
+    // past a certain N the batch runs fastest to hold it in L2. Below that the
+    // key tile does, which suits the dQ atomics.
+    const int h = blockIdx.y;
+    const int n = n_fastest ? blockIdx.x : blockIdx.z;
+    const int ktile = n_fastest ? blockIdx.z : blockIdx.x;
     const int k0 = ktile * BK;
     if (k0 >= Sk) {
         return;
@@ -398,10 +403,12 @@ static ffi::Error launch_bwd(cudaStream_t stream, int device, ffi::ScratchAlloca
     if (smem > 48 * 1024) {
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     }
-    dim3 grid((Sk + BK - 1) / BK, H, N);
+    const int nkt = (Sk + BK - 1) / BK;
+    const bool n_fastest = N >= 64;
+    dim3 grid = n_fastest ? dim3(N, H, nkt) : dim3(nkt, H, N);
     kern<<<grid, (BK / MMA_M) * WARP, smem, stream>>>(q, k, v, bias, kmask, dout, lse, delta,
                                                       dq_accum, dk, dv, dbias, N, H, Sq, Sk,
-                                                      scale);
+                                                      scale, n_fastest);
     to_half<<<256, 256, 0, stream>>>(dq_accum, dq, nq);
 
     cudaError_t err = cudaGetLastError();

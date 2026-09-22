@@ -335,6 +335,20 @@ def xla_case():
   return bad
 
 
+def dispatch_case():
+  """The backward maps its grid one way below a batch of 64 and the other way at
+  or above it, so both sides of that threshold need exercising."""
+  print('either side of the grid-order threshold')
+  bad = 0
+  for n in (63, 64, 96):
+    worst = try_run(n=n, h=2, sq=64, sk=64, d=32, quiet=True)
+    flag = '' if worst is not None and worst < 0.05 else '  FAIL'
+    bad += bool(flag)
+    print(f'  b={n:3d}   worst {worst:.2e}{flag}')
+  print('  ->', 'OK' if not bad else f'FAIL ({bad})')
+  return bad
+
+
 def want_flags_case():
   """want_lse and want_dbias only drop results, they never change the rest."""
   print('want_lse / want_dbias off')
@@ -381,6 +395,7 @@ if __name__ == '__main__':
   bad += repeat_case()
   bad += vjp_case()
   bad += xla_case()
+  bad += dispatch_case()
   bad += want_flags_case()
   print('RESULT:', 'PASS' if not bad else f'FAIL ({bad})')
   sys.exit(0 if not bad else 1)
