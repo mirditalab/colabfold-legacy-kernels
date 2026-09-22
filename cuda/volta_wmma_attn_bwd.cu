@@ -32,9 +32,11 @@
 
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <algorithm>
 #include <cstdint>
 #include <string>
 
+#include "volta_attn.h"
 #include "xla/ffi/api/ffi.h"
 
 namespace ffi = xla::ffi;
@@ -42,7 +44,6 @@ using namespace nvcuda;
 
 #define WARP 32
 #define FRAG 16
-#define LOG2E 1.4426950408889634f
 
 #define MAX_DEVICES 16
 
@@ -71,7 +72,7 @@ __device__ inline void load_tile(__half* dst, const __half* src, long long base,
 // -----------------------------------------------------------------------------
 // dQ (and dBias): 16 query rows per warp, looping over every key.
 // -----------------------------------------------------------------------------
-template <int D, int BQ, int BK>
+template <int D, int BQ, int BK, bool WANT_DBIAS>
 __global__ __launch_bounds__(BQ / FRAG * WARP) void volta_wmma_bwd_dq_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     const __half* __restrict__ bias, const uint8_t* __restrict__ kmask,
@@ -88,7 +89,9 @@ __global__ __launch_bounds__(BQ / FRAG * WARP) void volta_wmma_bwd_dq_kernel(
     const int warp = threadIdx.x / WARP;
     const int tid = threadIdx.x;
 
-    const int qtile = blockIdx.x, h = blockIdx.y, n = blockIdx.z;
+    // n runs fastest, so the blocks sharing a dBias tile are resident together
+    // and their atomics stay in L2.
+    const int n = blockIdx.x, h = blockIdx.y, qtile = blockIdx.z;
     const int q0 = qtile * BQ;
     if (q0 >= Sq) {
         return;
@@ -161,16 +164,27 @@ __global__ __launch_bounds__(BQ / FRAG * WARP) void volta_wmma_bwd_dq_kernel(
             const int r = i / BK, c = i - r * BK;
             const int r_loc = warp * FRAG + r;
             const int gq = q0 + r_loc, gk = k0 + c;
-            float g = 0.f;
-            if (gq < Sq && gk < Sk && kmask[(long long)n * Sk + gk] != 0) {
-                const float l2 = Ss[r_loc * SS_LD + c] * qk_scale +
-                                 __half2float(bias[bh + (long long)gq * Sk + gk]) * LOG2E;
-                const float p = exp2f(l2 - lse[rowbase + gq]);
-                g = p * (Ts[r_loc * SS_LD + c] - delta[rowbase + gq]);
-                // dBias sees the gradient of the pre-softmax logit itself,
-                // unscaled: the bias is added AFTER the q.k scaling.
-                if (dbias != nullptr && g != 0.f) {
-                    atomicAdd(&dbias[bh + (long long)gq * Sk + gk], g);
+            // the forward's clamped logit, so an all-masked row differentiates
+            // the uniform softmax it was given
+            // padded rows read the last real one: the value is discarded, and
+            // the address stays in range
+            const int gqc = gq < Sq ? gq : Sq - 1, gkc = gk < Sk ? gk : Sk - 1;
+            const long long bi = bh + (long long)gqc * Sk + gkc;
+            const bool live = gq < Sq && gk < Sk && kmask[(long long)n * Sk + gk] != 0;
+            // the clamped logit the forward used, so a row with every key masked
+            // differentiates the uniform softmax it was given
+            const float l2 = live ? (Ss[r_loc * SS_LD + c] * qk_scale +
+                                     __half2float(bias[bi]) * LOG2E)
+                                  : (MASKED_LOGIT * LOG2E);
+            const float p = exp2f(l2 - lse[rowbase + gqc]);
+            // a masked logit is a constant, so nothing flows back to q, k or the
+            // bias through it
+            const float g = live ? p * (Ts[r_loc * SS_LD + c] - delta[rowbase + gqc]) : 0.f;
+            // dBias sees the gradient of the pre-softmax logit itself,
+            // unscaled: the bias is added AFTER the q.k scaling.
+            if constexpr (WANT_DBIAS) {
+                if (gq < Sq && gk < Sk && g != 0.f) {
+                    atomicAdd(&dbias[bi], g);
                 }
             }
             DSs[r_loc * PS_LD + c] = __float2half(g);
@@ -299,17 +313,21 @@ __global__ __launch_bounds__(BK / FRAG * WARP) void volta_wmma_bwd_dkdv_kernel(
 
         // A key row the mask kills contributes nothing to dK or dV, and neither
         // does a query past the end: both fall out as P^T = 0.
+        // key index runs with the lane, so a warp reads one bias row coalesced
         for (int i = lane; i < FRAG * BQ; i += WARP) {
-            const int r = i / BQ, c = i - r * BQ;
+            const int c = i / FRAG, r = i - c * FRAG;
             const int k_loc = warp * FRAG + r;
             const int gk = k0 + k_loc, gq = qq + c;
-            float p = 0.f, ds = 0.f;
-            if (gq < Sq && gk < Sk && kmask[(long long)n * Sk + gk] != 0) {
-                const float l2 = Ss[k_loc * SS_LD + c] * qk_scale +
-                                 __half2float(bias[bh + (long long)gq * Sk + gk]) * LOG2E;
-                p = exp2f(l2 - lse[rowbase + gq]);
-                ds = p * (Ts[k_loc * SS_LD + c] - delta[rowbase + gq]);
-            }
+            const int gqc = gq < Sq ? gq : Sq - 1, gkc = gk < Sk ? gk : Sk - 1;
+            const bool live = gq < Sq && gk < Sk && kmask[(long long)n * Sk + gk] != 0;
+            const float l2 =
+                live ? (Ss[k_loc * SS_LD + c] * qk_scale +
+                        __half2float(bias[bh + (long long)gqc * Sk + gkc]) * LOG2E)
+                     : (MASKED_LOGIT * LOG2E);
+            // P carries dV even where the mask clamped the logit, but dS does
+            // not: a constant logit has no gradient
+            const float p = exp2f(l2 - lse[rowbase + gqc]);
+            const float ds = live ? p * (Ts[k_loc * SS_LD + c] - delta[rowbase + gqc]) : 0.f;
             Ps[k_loc * PS_LD + c] = __float2half(p);
             DSs[k_loc * PS_LD + c] = __float2half(ds);
         }
@@ -352,14 +370,32 @@ __global__ __launch_bounds__(BK / FRAG * WARP) void volta_wmma_bwd_dkdv_kernel(
     }
 }
 
-__global__ void zero_f32(float* p, long long n) {
+static __global__ void zero_f32(float* p, long long n) {
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (long long)gridDim.x * blockDim.x) {
         p[i] = 0.f;
     }
 }
 
-template <int D, int BQ, int BK>
+template <typename A, typename B>
+static bool same_shape(const A& a, const B& b) {
+    return a.dimensions().size() == b.dimensions().size() &&
+           std::equal(a.dimensions().begin(), a.dimensions().end(), b.dimensions().begin());
+}
+
+template <typename A>
+static bool rows_are(const A& a, int N, int H, int S) {
+    auto d = a.dimensions();
+    return d.size() == 3 && d[0] == N && d[1] == H && d[2] == S;
+}
+
+template <typename A>
+static bool bias_is(const A& a, int H, int Sq, int Sk) {
+    auto d = a.dimensions();
+    return d.size() == 3 && d[0] == H && d[1] == Sq && d[2] == Sk;
+}
+
+template <int D, int BQ, int BK, bool WANT_DBIAS>
 static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, const __half* k,
                              const __half* v, const __half* bias, const uint8_t* kmask,
                              const __half* dout, const float* lse, const float* delta, __half* dq,
@@ -367,10 +403,12 @@ static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, c
                              int DR, float scale) {
     constexpr int DQ_SS = (BK > D ? BK : D) + 4;
     constexpr int DKDV_SS = (BQ > D ? BQ : D) + 4;
-    const size_t smem_dq = (size_t)(2 * BQ * DQ_SS) * sizeof(float) +
-                           (size_t)(BQ * (BK + 8) + 2 * BQ * D + 2 * BK * D) * sizeof(__half);
-    const size_t smem_dkdv = (size_t)(2 * BK * DKDV_SS) * sizeof(float) +
-                             (size_t)(2 * BK * (BQ + 8) + 2 * BK * D + 2 * BQ * D) * sizeof(__half);
+    constexpr size_t smem_dq =
+        (size_t)(2 * BQ * DQ_SS) * sizeof(float) +
+        (size_t)(BQ * (BK + 8) + 2 * BQ * D + 2 * BK * D) * sizeof(__half);
+    constexpr size_t smem_dkdv =
+        (size_t)(2 * BK * DKDV_SS) * sizeof(float) +
+        (size_t)(2 * BK * (BQ + 8) + 2 * BK * D + 2 * BQ * D) * sizeof(__half);
     const int max_smem = bwd_shared_limit(device);
     const size_t need = smem_dq > smem_dkdv ? smem_dq : smem_dkdv;
     if ((int)need > max_smem) {
@@ -379,16 +417,15 @@ static ffi::Error launch_bwd(cudaStream_t stream, int device, const __half* q, c
                                            std::to_string(max_smem / 1024) + " KB");
     }
 
-    if (dbias != nullptr) {
-        const long long nb = (long long)H * Sq * Sk;
-        zero_f32<<<256, 256, 0, stream>>>(dbias, nb);
-    }
+    // dBias accumulates, thus it starts at zero, and stays zero when unwanted.
+    const long long nb = (long long)H * Sq * Sk;
+    zero_f32<<<256, 256, 0, stream>>>(dbias, nb);
 
-    auto kern_dq = volta_wmma_bwd_dq_kernel<D, BQ, BK>;
+    auto kern_dq = volta_wmma_bwd_dq_kernel<D, BQ, BK, WANT_DBIAS>;
     if (smem_dq > 48 * 1024) {
         cudaFuncSetAttribute(kern_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_dq);
     }
-    dim3 grid_dq((Sq + BQ - 1) / BQ, H, N);
+    dim3 grid_dq(N, H, (Sq + BQ - 1) / BQ);
     kern_dq<<<grid_dq, (BQ / FRAG) * WARP, smem_dq, stream>>>(
         q, k, v, bias, kmask, dout, lse, delta, dq, dbias, N, H, Sq, Sk, DR, scale);
 
@@ -420,13 +457,23 @@ ffi::Error VoltaWmmaBwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi
                             ffi::Result<ffi::Buffer<ffi::DataType::F16>> dk,
                             ffi::Result<ffi::Buffer<ffi::DataType::F16>> dv,
                             ffi::Result<ffi::Buffer<ffi::DataType::F32>> dbias, float scale,
-                            int64_t block_q, int64_t block_k) {
+                            bool want_dbias) {
     auto d = q.dimensions();
     if (d.size() != 4) {
         return ffi::Error::InvalidArgument("q must be [N,H,S,D]");
     }
     const int N = (int)d[0], H = (int)d[1], Sq = (int)d[2], D = (int)d[3];
     const int Sk = (int)k.dimensions()[2];
+    if (!same_shape(v, k) || !same_shape(dout, q)) {
+        return ffi::Error::InvalidArgument("volta_wmma_bwd: v must match k, dout must match q");
+    }
+    if (!rows_are(lse, N, H, Sq) || !rows_are(delta, N, H, Sq)) {
+        return ffi::Error::InvalidArgument("volta_wmma_bwd: lse and delta must be [N,H,Sq]");
+    }
+    if (!bias_is(bias, H, Sq, Sk) || !bias_is(*dbias, H, Sq, Sk)) {
+        return ffi::Error::InvalidArgument("volta_wmma_bwd: bias and dbias must be [H,Sq,Sk]");
+    }
+
     const __half* qp = reinterpret_cast<const __half*>(q.typed_data());
     const __half* kp = reinterpret_cast<const __half*>(k.typed_data());
     const __half* vp = reinterpret_cast<const __half*>(v.typed_data());
@@ -440,29 +487,24 @@ ffi::Error VoltaWmmaBwdImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi
     __half* dvp = reinterpret_cast<__half*>(dv->typed_data());
     float* dbp = reinterpret_cast<float*>(dbias->typed_data());
 
-#define DISPATCH_BWD_T(TILE, DD, BQ, BK)                                                           \
-    if (D == (DD) && block_q == (BQ) && block_k == (BK))                                           \
-        return launch_bwd<TILE, BQ, BK>(stream, device, qp, kp, vp, bp, mp, dop, lp, dlp, dqp,     \
-                                        dkp, dvp, dbp, N, H, Sq, Sk, (DD), scale);
-#define DISPATCH_BWD(DD, BQ, BK) DISPATCH_BWD_T(DD, DD, BQ, BK)
-    DISPATCH_BWD(16, 64, 64)
-    DISPATCH_BWD(16, 64, 32)
-    DISPATCH_BWD(16, 32, 32)
-    DISPATCH_BWD(32, 64, 64)
-    DISPATCH_BWD(32, 64, 32)
-    DISPATCH_BWD(32, 32, 32)
-    DISPATCH_BWD(32, 128, 64)
-    DISPATCH_BWD(32, 128, 32)
-    DISPATCH_BWD(64, 64, 64)
-    DISPATCH_BWD(64, 64, 32)
-    DISPATCH_BWD(64, 32, 32)
+    // The backward holds four tiles where the forward holds two, thus a tiling
+    // of its own rather than the forward's: 32x32 measures best, except at head
+    // 64 where a 64-row query tile is a third faster. 63 KB at most.
+#define DISPATCH_BWD_T(TILE, DD, BQ)                                                               \
+    if (D == (DD))                                                                                 \
+        return want_dbias ? launch_bwd<TILE, BQ, 32, true>(stream, device, qp, kp, vp, bp, mp,     \
+                                                           dop, lp, dlp, dqp, dkp, dvp, dbp, N,   \
+                                                           H, Sq, Sk, (DD), scale)                 \
+                          : launch_bwd<TILE, BQ, 32, false>(stream, device, qp, kp, vp, bp, mp,    \
+                                                            dop, lp, dlp, dqp, dkp, dvp, dbp, N,  \
+                                                            H, Sq, Sk, (DD), scale);
     // head 8 rides in a 16-wide tile, zero-padded, as it does in the forward.
-    DISPATCH_BWD_T(16, 8, 64, 64)
-    DISPATCH_BWD_T(16, 8, 64, 32)
-    DISPATCH_BWD_T(16, 8, 32, 32)
-#undef DISPATCH_BWD
+    DISPATCH_BWD_T(16, 8, 32)
+    DISPATCH_BWD_T(16, 16, 32)
+    DISPATCH_BWD_T(32, 32, 32)
+    DISPATCH_BWD_T(64, 64, 64)
 #undef DISPATCH_BWD_T
-    return ffi::Error::InvalidArgument("volta_wmma_bwd: unsupported (D, bq, bk)");
+    return ffi::Error::InvalidArgument("volta_wmma_bwd: unsupported head dim");
 }
 
 // NOT kCmdBufferCompatible: this handler starts three kernels, and the first
@@ -484,5 +526,4 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmmaBwd, VoltaWmmaBwdImpl,
                                   .Ret<ffi::Buffer<ffi::DataType::F16>>()
                                   .Ret<ffi::Buffer<ffi::DataType::F32>>()
                                   .Attr<float>("scale")
-                                  .Attr<int64_t>("block_q")
-                                  .Attr<int64_t>("block_k"));
+                                  .Attr<bool>("want_dbias"));
