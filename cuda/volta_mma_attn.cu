@@ -1,7 +1,7 @@
 // Flash attention for Turing and later (sm_75+), with CUTLASS mma.sync.m16n8k8.
 // The accumulator and the operand A have the same fragment layout.
 // Thus the softmax stays in registers. Volta cannot do this.
-// Inputs: q,k,v [N,H,S,D] f16, bias [H,Sq,Sk] f16, kmask [N,Sk] u8.
+// Inputs: q,k,v [N,H,S,D] f16 (or strided, see AttnLayout), bias [H,Sq,Sk] f16, kmask [N,Sk] u8.
 
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -69,7 +69,7 @@ template <int D, int BQ, int BK, bool WANT_LSE>
 __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
     const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
     const __half* __restrict__ bias, const uint8_t* __restrict__ kmask, __half* __restrict__ out,
-    float* __restrict__ lse, int N, int H, int Sq, int Sk, float sm_scale) {
+    float* __restrict__ lse, int N, int H, int Sq, int Sk, float sm_scale, AttnLayout L) {
     constexpr int NWARP = BQ / MMA_M;
     constexpr int NK = BK / MMA_N;   // key sub-tiles per BK tile
     constexpr int ND = D / MMA_N;    // output dim sub-tiles
@@ -98,14 +98,13 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
     __half* Vs = Ks + BK * D;                     // [BK][D]
     __half* Bs = Vs + BK * D;                     // [BQ][BK] bias tile
 
-    const long long qkv = (long long)(n * H + h) * Sq * D;
-    const long long kv = (long long)(n * H + h) * Sk * D;
+    const long long qb = n * L.qn + h * L.qh, kb = n * L.kn + h * L.kh, ob = n * L.on + h * L.oh;
     const long long bh = (long long)h * Sq * Sk;
 
     for (int i = tid; i < BQ * D; i += nthreads) {
         int r = i / D, c = i - r * D;
         int gq = q0 + r;
-        Qs[i] = (gq < Sq) ? q[qkv + (long long)gq * D + c] : __float2half(0.f);
+        Qs[i] = (gq < Sq) ? q[qb + gq * L.qs + c] : __float2half(0.f);
     }
     __syncthreads();
 
@@ -140,8 +139,8 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
             int r = i / D, c = i - r * D;
             int gk = k0 + r;
             bool ok = (gk < Sk);
-            Ks[i] = ok ? k[kv + (long long)gk * D + c] : __float2half(0.f);
-            Vs[i] = ok ? v[kv + (long long)gk * D + c] : __float2half(0.f);
+            Ks[i] = ok ? k[kb + gk * L.ks + c] : __float2half(0.f);
+            Vs[i] = ok ? v[kb + gk * L.ks + c] : __float2half(0.f);
         }
         for (int i = tid; i < BQ * BK; i += nthreads) { // coalesced bias staging
             int r = i / BK, c = i - r * BK;
@@ -182,7 +181,8 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
                     const int g_q = q0 + r_loc;
                     float val;
                     if (g_q >= Sq || col >= Sk || kmask[(long long)n * Sk + col] == 0) {
-                        val = MASKED_LOGIT * LOG2E;
+                        // keys past Sk get no weight, so a fully masked row averages Sk keys
+                        val = (col >= Sk && g_q < Sq) ? -INFINITY : MASKED_LOGIT * LOG2E;
                     } else {
                         val = s[nt][half_i * 2 + j] * qk_scale +
                               __half2float(Bs[r_loc * BK + nt * MMA_N + lc + j]) * LOG2E;
@@ -280,7 +280,8 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 const int col = d * MMA_N + lc + j;
-                out[qkv + (long long)gq * D + col] = __float2half(acc[d][half_i * 2 + j] * inv);
+                out[ob + gq * L.os + col] = __float2half(
+                    L.apply_gate(acc[d][half_i * 2 + j] * inv, qb + gq * L.qs + col, h, col, D));
             }
         }
     }
@@ -290,7 +291,8 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
 template <int D, int BQ, int BK, bool WANT_LSE>
 static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const __half* k,
                          const __half* v, const __half* bias, const uint8_t* kmask, __half* out,
-                         float* lse, int N, int H, int Sq, int Sk, float scale) {
+                         float* lse, int N, int H, int Sq, int Sk, float scale,
+                         const AttnLayout& L) {
     constexpr int NWARP = BQ / MMA_M;
     constexpr size_t smem = (size_t)(BQ * D + 2 * BK * D + BQ * BK) * sizeof(__half);
     auto kern = volta_mma_kernel<D, BQ, BK, WANT_LSE>;
@@ -308,7 +310,7 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
     }
     dim3 grid((Sq + BQ - 1) / BQ, H, N);
     kern<<<grid, NWARP * WARP, smem, stream>>>(q, k, v, bias, kmask, out, lse, N, H, Sq, Sk,
-                                               scale);
+                                               scale, L);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         return ffi::Error::Internal(std::string("volta_mma launch: ") + cudaGetErrorString(err));
@@ -317,31 +319,15 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
 }
 
 template <bool WANT_LSE>
-static ffi::Error volta_mma_common(cudaStream_t stream, int32_t device,
-                                   ffi::Buffer<ffi::DataType::F16> q,
-                                   ffi::Buffer<ffi::DataType::F16> k,
-                                   ffi::Buffer<ffi::DataType::F16> v,
-                                   ffi::Buffer<ffi::DataType::F16> bias,
-                                   ffi::Buffer<ffi::DataType::U8> kmask,
-                                   ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, float* lse,
-                                   float scale, int64_t block_q, int64_t block_k) {
-    auto d = q.dimensions();
-    if (d.size() != 4) {
-        return ffi::Error::InvalidArgument("q must be [N,H,S,D]");
-    }
-    const int N = (int)d[0], H = (int)d[1], Sq = (int)d[2], D = (int)d[3];
-    const int Sk = (int)k.dimensions()[2];
-    const __half* qp = reinterpret_cast<const __half*>(q.typed_data());
-    const __half* kp = reinterpret_cast<const __half*>(k.typed_data());
-    const __half* vp = reinterpret_cast<const __half*>(v.typed_data());
-    const __half* bp = reinterpret_cast<const __half*>(bias.typed_data());
-    const uint8_t* mp = kmask.typed_data();
-    __half* op = reinterpret_cast<__half*>(out->typed_data());
-
+static ffi::Error volta_mma_common(cudaStream_t stream, int32_t device, const __half* qp,
+                                   const __half* kp, const __half* vp, const __half* bp,
+                                   const uint8_t* mp, __half* op, float* lse, int N, int H, int Sq,
+                                   int Sk, int D, const AttnLayout& L, float scale,
+                                   int64_t block_q, int64_t block_k) {
 #define DISPATCH(DD, BQ, BK)                                                                       \
     if (D == (DD) && block_q == (BQ) && block_k == (BK))                                           \
         return launch<DD, BQ, BK, WANT_LSE>(stream, device, qp, kp, vp, bp, mp, op, lse, N, H,   \
-                                            Sq, Sk, scale);
+                                            Sq, Sk, scale, L);
     DISPATCH(8, 64, 64)
     DISPATCH(8, 64, 32)
     DISPATCH(8, 32, 32)
@@ -364,13 +350,66 @@ ffi::Error VoltaMmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::Da
                         ffi::Result<ffi::Buffer<ffi::DataType::F16>> out,
                         ffi::Result<ffi::Buffer<ffi::DataType::F32>> lse, float scale,
                         int64_t block_q, int64_t block_k, bool want_lse) {
-    if (want_lse) {
-        return volta_mma_common<true>(stream, device, q, k, v, bias, kmask, out,
-                                      lse->typed_data(), scale, block_q, block_k);
+    auto d = q.dimensions();
+    if (d.size() != 4) {
+        return ffi::Error::InvalidArgument("q must be [N,H,S,D]");
     }
-    return volta_mma_common<false>(stream, device, q, k, v, bias, kmask, out, nullptr, scale,
-                                   block_q, block_k);
+    const int N = (int)d[0], H = (int)d[1], Sq = (int)d[2], D = (int)d[3];
+    const int Sk = (int)k.dimensions()[2];
+    const auto L = AttnLayout::contiguous(H, Sq, Sk, D);
+    auto f16 = [](auto& b) { return reinterpret_cast<const __half*>(b.typed_data()); };
+    __half* op = reinterpret_cast<__half*>(out->typed_data());
+    return (want_lse ? volta_mma_common<true> : volta_mma_common<false>)(
+        stream, device, f16(q), f16(k), f16(v), f16(bias), kmask.typed_data(), op,
+        want_lse ? lse->typed_data() : nullptr, N, H, Sq, Sk, D, L, scale, block_q, block_k);
 }
+
+// Forward only: q/k/v (and the gate when G == 4) read in place from p [X, Y, G, H, D], out
+// [X, Y, H, D]. Rows attend along Y; with column set, columns attend along X.
+ffi::Error VoltaMmaPackedImpl(cudaStream_t stream, int32_t device,
+                              ffi::Buffer<ffi::DataType::F16> p,
+                              ffi::Buffer<ffi::DataType::F16> bias,
+                              ffi::Buffer<ffi::DataType::U8> kmask,
+                              ffi::Buffer<ffi::DataType::F16> gate_bias,
+                              ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, float scale,
+                              int64_t block_q, int64_t block_k, bool column) {
+    auto d = p.dimensions();
+    if (d.size() != 5 || (d[2] != 3 && d[2] != 4)) {
+        return ffi::Error::InvalidArgument("p must be [X,Y,3 or 4,H,D]");
+    }
+    const int X = (int)d[0], Y = (int)d[1], G = (int)d[2], H = (int)d[3], D = (int)d[4];
+    const __half* pp = reinterpret_cast<const __half*>(p.typed_data());
+    auto L = AttnLayout::packed(Y, G, H, D, column);
+    if (G == 4) {
+        L.gate = pp + 3 * H * D;
+        L.gate_bias = reinterpret_cast<const __half*>(gate_bias.typed_data());
+    }
+    const int N = column ? Y : X, S = column ? X : Y;
+    if (bias.element_count() != (size_t)H * S * S || kmask.element_count() != (size_t)N * S ||
+        (G == 4 && gate_bias.element_count() != (size_t)H * D)) {
+        return ffi::Error::InvalidArgument("bias must be [H,S,S], kmask [N,S], gate_bias [H,D]");
+    }
+    return volta_mma_common<false>(stream, device, pp, pp + H * D, pp + 2 * H * D,
+                                   reinterpret_cast<const __half*>(bias.typed_data()),
+                                   kmask.typed_data(),
+                                   reinterpret_cast<__half*>(out->typed_data()), nullptr, N, H, S,
+                                   S, D, L, scale, block_q, block_k);
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaMmaPacked, VoltaMmaPackedImpl,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Ctx<ffi::DeviceOrdinal>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::U8>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Ret<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Attr<float>("scale")
+                                  .Attr<int64_t>("block_q")
+                                  .Attr<int64_t>("block_k")
+                                  .Attr<bool>("column"),
+                              {ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaMma, VoltaMmaImpl,
                               ffi::Ffi::Bind()
