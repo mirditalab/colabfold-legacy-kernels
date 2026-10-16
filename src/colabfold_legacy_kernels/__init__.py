@@ -34,6 +34,27 @@ _TABLE = {
         (75, "libvolta_ops.so", "VoltaGdp"),
         (70, "libvolta_gdp_wmma.so", "VoltaGdpWmma"),
     ),
+    # LayerNorm fused into the tri-mul and attention projections, at widths 64 and 128
+    "ln_gated_dual_proj": (
+        (75, "libvolta_ops.so", "VoltaLnGdp"),
+        (70, "libvolta_gdp_wmma.so", "VoltaLnGdpWmma"),
+    ),
+    "trimul_epilogue": (
+        (75, "libvolta_ops.so", "VoltaTrimulEpilogue"),
+        (70, "libvolta_gdp_wmma.so", "VoltaTrimulEpilogueWmma"),
+    ),
+    "ln_projection": (
+        (75, "libvolta_ops.so", "VoltaLnProj"),
+        (70, "libvolta_gdp_wmma.so", "VoltaLnProjWmma"),
+    ),
+    "output_projection": (
+        (75, "libvolta_ops.so", "VoltaOutProj"),
+        (70, "libvolta_gdp_wmma.so", "VoltaOutProjWmma"),
+    ),
+    "transition": (
+        (75, "libvolta_ops.so", "VoltaTransition"),
+        (70, "libvolta_gdp_wmma.so", "VoltaTransitionWmma"),
+    ),
 }
 
 KERNELS = tuple(_TABLE)

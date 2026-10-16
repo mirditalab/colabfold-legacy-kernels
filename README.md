@@ -1,8 +1,12 @@
 # colabfold-legacy-kernels
 
 Prebuilt CUDA kernels to make ColabFold fast on Volta and Turing NVIDIA GPUs.
-This package has three kernels that replace the Ampere+ Pallas/Triton kernels:
-Attention, layer norm and the gated dual projection.
+This package has kernels that replace the Ampere+ Pallas/Triton kernels:
+Attention, layer norm and the gated dual projection, and the AF2 pair-stack
+fusions that fold a LayerNorm into the projection after it: the tri-mul gated
+projection and epilogue, the attention input and output projections and the
+transition (`ln_gated_dual_proj`, `trimul_epilogue`, `ln_projection`,
+`output_projection`, `transition`; widths 64 and 128).
 
 ```python
 import colabfold_legacy_kernels as clk
