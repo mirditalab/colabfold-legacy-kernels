@@ -194,17 +194,19 @@ __global__ __launch_bounds__(BM / 16 *
                 continue;
             }
             const float mv = __half2float(mask[gm]);
+            // the lane's two adjacent columns as one half2: N % 8 == 0, so gn + 1 < N
+            const int gn = n0 + nt * 8 + lc;
+            if (gn >= N) {
+                continue;
+            }
+            float o[2];
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
-                const int gn = n0 + nt * 8 + lc + j;
-                if (gn >= N) {
-                    continue;
-                }
-                const float p = accp[nt][half_i * 2 + j] + __half2float(bp[gn]);
-                const float g = accg[nt][half_i * 2 + j] + __half2float(bg[gn]);
-                const float s = gdp_act<A>(g);
-                out[(long long)gm * N + gn] = __float2half(mv * p * s);
+                const float p = accp[nt][half_i * 2 + j] + __half2float(bp[gn + j]);
+                const float g = accg[nt][half_i * 2 + j] + __half2float(bg[gn + j]);
+                o[j] = mv * p * gdp_act<A>(g);
             }
+            *reinterpret_cast<__half2*>(out + (long long)gm * N + gn) = __floats2half2_rn(o[0], o[1]);
         }
     }
 }

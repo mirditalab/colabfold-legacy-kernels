@@ -83,16 +83,28 @@ __global__ __launch_bounds__(BM / FRAG * WARP, 2) void volta_gdp_wmma_kernel(
         wmma::store_matrix_sync(ep, accp[nt], FRAG, wmma::mem_row_major);
         wmma::store_matrix_sync(eg, accg[nt], FRAG, wmma::mem_row_major);
         __syncwarp();
-        for (int i = lane; i < FRAG * FRAG; i += WARP) {
+        // two adjacent columns per lane, stored as one half2
+        for (int i = 2 * lane; i < FRAG * FRAG; i += 2 * WARP) {
             const int r = i / FRAG, c = i - r * FRAG;
             const int gm = m0 + warp * FRAG + r, gn = n0 + nt * FRAG + c;
             if (gm >= M || gn >= N) {
                 continue;
             }
-            const float p = ep[i] + __half2float(bp[gn]);
-            const float g = eg[i] + __half2float(bg[gn]);
-            const float s = gdp_act<A>(g);
-            out[(long long)gm * N + gn] = __float2half(__half2float(mask[gm]) * p * s);
+            const float mv = __half2float(mask[gm]);
+            const bool pair = gn + 1 < N;
+            const float o0 = mv * (ep[i] + __half2float(bp[gn])) * gdp_act<A>(eg[i] + __half2float(bg[gn]));
+            const float o1 = pair ? mv * (ep[i + 1] + __half2float(bp[gn + 1])) *
+                                        gdp_act<A>(eg[i + 1] + __half2float(bg[gn + 1]))
+                                  : 0.f;
+            __half* o = out + (long long)gm * N + gn;
+            if (pair && (N & 1) == 0) {
+                *reinterpret_cast<__half2*>(o) = __floats2half2_rn(o0, o1);
+            } else {
+                o[0] = __float2half(o0);
+                if (pair) {
+                    o[1] = __float2half(o1);
+                }
+            }
         }
         __syncwarp();
     }
