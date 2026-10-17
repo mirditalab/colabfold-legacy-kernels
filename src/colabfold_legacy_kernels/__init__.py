@@ -11,7 +11,7 @@ __all__ = [
     "symbol",
 ]
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 _KERNEL_DIR = Path(__file__).resolve().parent / "kernels"
 
