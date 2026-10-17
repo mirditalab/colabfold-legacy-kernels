@@ -168,27 +168,23 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
             }
         }
 
-        // scale + bias + mask; then row max over this BK tile (2 rows per lane)
+        // scale + bias + mask without branches: a masked key takes MASKED_LOGIT, a key past Sk -inf
         float m_tile[2] = {-INFINITY, -INFINITY};
 #pragma unroll
         for (int nt = 0; nt < NK; ++nt) {
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 const int col = k0 + nt * MMA_N + lc + j;
+                const bool in = col < Sk;
+                const bool keep = in && kmask[(long long)n * Sk + (in ? col : Sk - 1)] != 0;
+                const float fill = in ? MASKED_LOGIT * LOG2E : -INFINITY;
 #pragma unroll
                 for (int half_i = 0; half_i < 2; ++half_i) {
                     const int r_loc = warp * MMA_M + lr + half_i * 8;
-                    const int g_q = q0 + r_loc;
-                    float val;
-                    if (g_q >= Sq || col >= Sk || kmask[(long long)n * Sk + col] == 0) {
-                        // keys past Sk get no weight, so a fully masked row averages Sk keys
-                        val = (col >= Sk && g_q < Sq) ? -INFINITY : MASKED_LOGIT * LOG2E;
-                    } else {
-                        val = s[nt][half_i * 2 + j] * qk_scale +
-                              __half2float(Bs[r_loc * BK + nt * MMA_N + lc + j]) * LOG2E;
-                    }
-                    s[nt][half_i * 2 + j] = val;
-                    m_tile[half_i] = fmaxf(m_tile[half_i], val);
+                    const float val = s[nt][half_i * 2 + j] * qk_scale +
+                                      __half2float(Bs[r_loc * BK + nt * MMA_N + lc + j]) * LOG2E;
+                    s[nt][half_i * 2 + j] = keep ? val : fill;
+                    m_tile[half_i] = fmaxf(m_tile[half_i], s[nt][half_i * 2 + j]);
                 }
             }
         }
