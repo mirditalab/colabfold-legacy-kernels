@@ -7,7 +7,10 @@ enum class GdpAct { kSigmoid, kSwish };
 
 template <GdpAct A>
 __device__ __forceinline__ float gdp_act(float g) {
-    const float s = 1.0f / (1.0f + __expf(-g));
+    // ftz exp and approximate divide: MUFU.EX2 + MUFU.RCP, no denormal fixup, no IEEE divide subroutine
+    float e;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(-1.4426950408889634f * g));
+    const float s = __fdividef(1.0f, 1.0f + e);
     return A == GdpAct::kSwish ? g * s : s;
 }
 

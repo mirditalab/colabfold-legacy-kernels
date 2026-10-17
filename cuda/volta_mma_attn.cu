@@ -203,7 +203,7 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
             m_new[i] = fmaxf(m_run[i], m_tile[i]);
-            alpha[i] = exp2f(m_run[i] - m_new[i]); // 0 on the first tile
+            alpha[i] = ex2_ftz(m_run[i] - m_new[i]); // 0 on the first tile
         }
 
         // P = exp2(S - m_new), converted in place to the A operand of P@V
@@ -214,7 +214,7 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
             for (int half_i = 0; half_i < 2; ++half_i) {
 #pragma unroll
                 for (int j = 0; j < 2; ++j) {
-                    float e = exp2f(s[nt][half_i * 2 + j] - m_new[half_i]);
+                    float e = ex2_ftz(s[nt][half_i * 2 + j] - m_new[half_i]);
                     l_tile[half_i] += e;
                     p[nt][half_i * 2 + j] = cutlass::half_t(e);
                 }

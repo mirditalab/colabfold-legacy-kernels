@@ -13,6 +13,13 @@
 // The softmax runs in the log2 domain, where exp2 is one instruction.
 #define LOG2E 1.4426950408889634f
 
+// exp2 as one MUFU.EX2: exp2f adds a denormal fixup the softmax never needs
+__device__ __forceinline__ float ex2_ftz(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
 
 // Element strides of q (and the gate), k/v and out, as [n][h][s][c] with c contiguous, and an
 // optional gate: out = attention * sigmoid(gate + gate_bias[h]). Contiguous [N,H,S,D] by default;
@@ -38,6 +45,6 @@ struct AttnLayout {
             return o;
         }
         const float g = __half2float(gate[qi]) + __half2float(gate_bias[h * d + c]);
-        return o / (1.f + __expf(-g));
+        return __fdividef(o, 1.f + ex2_ftz(-LOG2E * g));
     }
 };

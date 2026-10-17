@@ -182,12 +182,12 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
 
         float l_part = 0.f;
         for (int c = half_id; c < BK; c += 2) {
-            float p = exp2f(Ss[r_blk * SS_LD + c] - m_cur);
+            float p = ex2_ftz(Ss[r_blk * SS_LD + c] - m_cur);
             Ps[r_blk * PS_LD + c] = __float2half(p);
             l_part += p;
         }
         l_part += __shfl_xor_sync(0xffffffffu, l_part, 1);
-        const float alpha = exp2f(m_prev - m_cur);
+        const float alpha = ex2_ftz(m_prev - m_cur);
         if (half_id == 0) {
             ms[r_blk] = m_cur;
             ls[r_blk] = ls[r_blk] * alpha + l_part;
