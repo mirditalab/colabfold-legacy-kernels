@@ -79,6 +79,20 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     const long long qb = n * L.qn + h * L.qh, kb = n * L.kn + h * L.kh, ob = n * L.on + h * L.oh;
     const long long bh = (long long)h * Sq * Sk;
 
+    int k_end = Sk;
+    if (L.lims != nullptr) {
+        k_end = L.lims[n];
+        if (k_end == 0 || q0 >= L.lims[N]) {
+            for (int i = tid; i < BQ * DR; i += TPB) {
+                const int gq = q0 + i / DR;
+                if (gq < Sq) {
+                    out[ob + gq * L.os + i % DR] = __float2half(0.f);
+                }
+            }
+            return;
+        }
+    }
+
     // stage Q in the (still unused) S buffer and hoist its fragments
     __half* Qs = reinterpret_cast<__half*>(Ss);
     for (int i = tid; i < BQ * D; i += TPB) {
@@ -139,10 +153,10 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     commit_loads();
     __syncthreads();
 
-    for (int k0 = 0; k0 < Sk; k0 += BK) {
+    for (int k0 = 0; k0 < k_end; k0 += BK) {
         // Start the loads for the next tile now. The GEMMs below hide the delay.
         const int k_next = k0 + BK;
-        if (k_next < Sk) {
+        if (k_next < k_end) {
             issue_loads(k_next);
         }
 
@@ -320,7 +334,7 @@ ffi::Error VoltaWmmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::D
 }
 
 // Forward only, as VoltaMmaPacked: q/k/v (and the gate when G == 4) read in place from p.
-ffi::Error VoltaWmmaPackedImpl(cudaStream_t stream, int32_t device,
+static ffi::Error VoltaWmmaPackedImpl(const int* lims, cudaStream_t stream, int32_t device,
                                ffi::Buffer<ffi::DataType::F16> p,
                                ffi::Buffer<ffi::DataType::F16> bias,
                                ffi::Buffer<ffi::DataType::U8> kmask,
@@ -338,6 +352,7 @@ ffi::Error VoltaWmmaPackedImpl(cudaStream_t stream, int32_t device,
         L.gate = pp + 3 * H * D;
         L.gate_bias = reinterpret_cast<const __half*>(gate_bias.typed_data());
     }
+    L.lims = lims;
     const int N = column ? Y : X, S = column ? X : Y;
     if (bias.element_count() != (size_t)H * S * S || kmask.element_count() != (size_t)N * S ||
         (G == 4 && gate_bias.element_count() != (size_t)H * D)) {
@@ -350,7 +365,24 @@ ffi::Error VoltaWmmaPackedImpl(cudaStream_t stream, int32_t device,
                                     S, S, D, L, scale, block_q, block_k);
 }
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmmaPacked, VoltaWmmaPackedImpl,
+static ffi::Error VoltaWmmaPackedNoTrim(cudaStream_t stream, int32_t device,
+                    ffi::Buffer<ffi::DataType::F16> p, ffi::Buffer<ffi::DataType::F16> bias,
+                    ffi::Buffer<ffi::DataType::U8> kmask, ffi::Buffer<ffi::DataType::F16> gate_bias,
+                    ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, float scale, int64_t block_q,
+                    int64_t block_k, bool column) {
+    return VoltaWmmaPackedImpl(nullptr, stream, device, p, bias, kmask, gate_bias, out, scale, block_q, block_k, column);
+}
+
+// VoltaWmmaPacked with trim: lims [N + 1] from packed_attn.trim_limits(kmask, 1)
+static ffi::Error VoltaWmmaPackedTrimImpl(cudaStream_t stream, int32_t device,
+                    ffi::Buffer<ffi::DataType::F16> p, ffi::Buffer<ffi::DataType::F16> bias,
+                    ffi::Buffer<ffi::DataType::U8> kmask, ffi::Buffer<ffi::DataType::F16> gate_bias, ffi::Buffer<ffi::DataType::S32> lims,
+                    ffi::Result<ffi::Buffer<ffi::DataType::F16>> out, float scale, int64_t block_q,
+                    int64_t block_k, bool column) {
+    return VoltaWmmaPackedImpl(lims.typed_data(), stream, device, p, bias, kmask, gate_bias, out, scale, block_q, block_k, column);
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmmaPacked, VoltaWmmaPackedNoTrim,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>()
                                   .Ctx<ffi::DeviceOrdinal>()
@@ -358,6 +390,22 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmmaPacked, VoltaWmmaPackedImpl,
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
                                   .Arg<ffi::Buffer<ffi::DataType::U8>>()
                                   .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Ret<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Attr<float>("scale")
+                                  .Attr<int64_t>("block_q")
+                                  .Attr<int64_t>("block_k")
+                                  .Attr<bool>("column"),
+                              {ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(VoltaWmmaPackedTrim, VoltaWmmaPackedTrimImpl,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Ctx<ffi::DeviceOrdinal>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::U8>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::F16>>()
+                                  .Arg<ffi::Buffer<ffi::DataType::S32>>()
                                   .Ret<ffi::Buffer<ffi::DataType::F16>>()
                                   .Attr<float>("scale")
                                   .Attr<int64_t>("block_q")

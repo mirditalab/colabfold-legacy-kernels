@@ -28,6 +28,9 @@ struct AttnLayout {
     long long qn, qh, qs, kn, kh, ks, on, oh, os;
     const __half* gate = nullptr;
     const __half* gate_bias = nullptr;
+    // trim (packed_attn.trim_limits): lims[n] ends batch row n's live keys, lims[N] every row's; a query tile past that,
+    // or a row with no live key, is padding and gets zeros. Null keeps every key and query.
+    const int* lims = nullptr;
 
     static AttnLayout contiguous(int H, int Sq, int Sk, int D) {
         return {(long long)H * Sq * D, (long long)Sq * D, D, (long long)H * Sk * D,
