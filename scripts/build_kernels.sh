@@ -83,7 +83,8 @@ else
   exit 1
 fi
 
-FLAGS="-O3 -std=c++17 -Xcompiler -fPIC $STATIC
+# -warn-spills: spills show in the log (the head-96 backward spills a few bytes on sm_70, the rest none)
+FLAGS="-O3 -std=c++17 -Xcompiler -fPIC $STATIC -Xptxas -warn-spills
        -gencode arch=compute_${ARCH},code=sm_${ARCH}
        -Wno-deprecated-gpu-targets -diag-suppress 940,2473
        -I$FFI_INC -I$CUTLASS/include"
@@ -93,6 +94,7 @@ run_nvcc() {
     cat "$work/nvcc.log" >&2
     return 1
   fi
+  grep -h "spilled" "$work/nvcc.log" >&2 || true
 }
 
 # Fields: library : source : minimum arch : arch that must use tensor cores.
