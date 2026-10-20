@@ -63,6 +63,15 @@ using FragA = cutlass::Array<cutlass::half_t, 4>;
 using FragB = cutlass::Array<cutlass::half_t, 2>;
 using FragC = cutlass::Array<float, 4>;
 
+// 16 bytes from global memory, prefetching the 128-byte L2 sector (sm_75's ld.global .L2::128B)
+__device__ __forceinline__ uint4 ldg16(const __half* p) {
+    uint4 r;
+    asm volatile("ld.global.nc.L2::128B.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+                 : "l"(p));
+    return r;
+}
+
 // BQ must be a multiple of 16 (one warp owns MMA_M=16 query rows).
 // BK and D must be multiples of 8.
 template <int D, int BQ, int BK, bool WANT_LSE>
@@ -146,20 +155,46 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
 
     MmaOp mma_op;
     const float qk_scale = sm_scale * LOG2E; // fold log2(e) so we can use exp2
+    // 16-byte staging where rows are 16-byte aligned (the packed layout's, and the bias at a length padded to 8)
+    const auto aligned = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; };
+    const bool vec_kv = L.ks % 8 == 0 && kb % 8 == 0 && aligned(k) && aligned(v);
+    const bool vec_b = Sk % 8 == 0 && aligned(bias);
 
     for (int k0 = 0; k0 < k_end; k0 += BK) {
         __syncthreads();
-        for (int i = tid; i < BK * D; i += nthreads) {
-            int r = i / D, c = i - r * D;
-            int gk = k0 + r;
-            bool ok = (gk < Sk);
-            Ks[i] = ok ? k[kb + gk * L.ks + c] : __float2half(0.f);
-            Vs[i] = ok ? v[kb + gk * L.ks + c] : __float2half(0.f);
+        if (vec_kv) {
+            for (int i = tid; i < BK * D / 8; i += nthreads) {
+                const int r = i / (D / 8), c = (i - r * (D / 8)) * 8, gk = k0 + r;
+                uint4 kx = make_uint4(0, 0, 0, 0), vx = kx;
+                if (gk < Sk) {
+                    kx = ldg16(k + kb + gk * L.ks + c);
+                    vx = ldg16(v + kb + gk * L.ks + c);
+                }
+                *reinterpret_cast<uint4*>(Ks + r * D + c) = kx;
+                *reinterpret_cast<uint4*>(Vs + r * D + c) = vx;
+            }
+        } else {
+            for (int i = tid; i < BK * D; i += nthreads) {
+                int r = i / D, c = i - r * D;
+                int gk = k0 + r;
+                bool ok = (gk < Sk);
+                Ks[i] = ok ? k[kb + gk * L.ks + c] : __float2half(0.f);
+                Vs[i] = ok ? v[kb + gk * L.ks + c] : __float2half(0.f);
+            }
         }
-        for (int i = tid; i < BQ * BK; i += nthreads) { // coalesced bias staging
-            int r = i / BK, c = i - r * BK;
-            int gq = q0 + r, gk = k0 + c;
-            Bs[i] = (gq < Sq && gk < Sk) ? bias[bh + (long long)gq * Sk + gk] : __float2half(0.f);
+        if (vec_b) {
+            for (int i = tid; i < BQ * BK / 8; i += nthreads) {
+                const int r = i / (BK / 8), c = (i - r * (BK / 8)) * 8, gq = q0 + r, gk = k0 + c;
+                const uint4 bx = (gq < Sq && gk < Sk) ? ldg16(bias + bh + (long long)gq * Sk + gk)
+                                                      : make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4*>(Bs + r * BK + c) = bx;
+            }
+        } else {
+            for (int i = tid; i < BQ * BK; i += nthreads) { // coalesced bias staging
+                int r = i / BK, c = i - r * BK;
+                int gq = q0 + r, gk = k0 + c;
+                Bs[i] = (gq < Sq && gk < Sk) ? bias[bh + (long long)gq * Sk + gk] : __float2half(0.f);
+            }
         }
         __syncthreads();
 
@@ -209,11 +244,14 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
             m_tile[half_i] = fmaxf(m_tile[half_i], __shfl_xor_sync(0xffffffffu, m_tile[half_i], 2));
         }
 
+        // the running max moves only when a tile raises it past 2^6 (FlashMLA's rule, decided per warp): otherwise O and
+        // l keep their scale and this tile's exp2 stays below 2^6, well inside fp16 P and the fp32 sums
+        const bool raise = __any_sync(0xffffffffu, m_tile[0] > m_run[0] + 6.f || m_tile[1] > m_run[1] + 6.f);
         float m_new[2], alpha[2], l_tile[2] = {0.f, 0.f};
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            m_new[i] = fmaxf(m_run[i], m_tile[i]);
-            alpha[i] = ex2_ftz(m_run[i] - m_new[i]); // 0 on the first tile
+            m_new[i] = raise ? fmaxf(m_run[i], m_tile[i]) : m_run[i];
+            alpha[i] = raise ? ex2_ftz(m_run[i] - m_new[i]) : 1.f; // 0 on the first tile
         }
 
         // P = exp2(S - m_new), converted in place to the A operand of P@V
@@ -241,12 +279,14 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
 // O = O*alpha + P @ V
 #pragma unroll
         for (int d = 0; d < ND; ++d) {
+            if (raise) {
 #pragma unroll
-            for (int half_i = 0; half_i < 2; ++half_i)
+                for (int half_i = 0; half_i < 2; ++half_i)
 #pragma unroll
-                for (int j = 0; j < 2; ++j) {
-                    acc[d][half_i * 2 + j] *= alpha[half_i];
-                }
+                    for (int j = 0; j < 2; ++j) {
+                        acc[d][half_i * 2 + j] *= alpha[half_i];
+                    }
+            }
 #pragma unroll
             for (int nt = 0; nt < NK; ++nt) {
                 // B[k][n] = V[key][dim]; lane holds k=(t%4)*2+{0,1}, n=t/4
