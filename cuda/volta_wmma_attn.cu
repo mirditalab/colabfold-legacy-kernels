@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include "volta_attn.h"
 #include "xla/ffi/api/ffi.h"
@@ -406,6 +407,299 @@ ffi::Error VoltaWmmaImpl(cudaStream_t stream, int32_t device, ffi::Buffer<ffi::D
         want_lse ? lse->typed_data() : nullptr, N, H, Sq, Sk, D, L, scale, block_q, block_k);
 }
 
+
+// m8n8k4, sm_70's native HMMA: one warp instruction is four 8x8x4 products, one per quad-pair qp = (lane >> 2) & 3 (lanes
+// 4qp..4qp+3 and 16+4qp..16+4qp+3). Unlike wmma's, its fragment layouts are documented (and checked by a probe), so the
+// packed attention below keeps S, P and O in registers: no shared-memory round trip per key tile but K, V and bias.
+//   A (.row): a lane holds row (lane & 3) + 4 * (lane >> 4), k 0..3; B (.col): column (lane & 3) + 4 * (lane >> 4)
+//   accumulator: element i at row (lane & 1) + (i & 2) + 4 * (lane >> 4), column (i & 4) + (lane & 2) + (i & 1)
+__device__ __forceinline__ void mma884(float (&d)[8], uint32_t a01, uint32_t a23, uint32_t b01, uint32_t b23) {
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, "
+                 "{%10, %11}, {%0, %1, %2, %3, %4, %5, %6, %7};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+                 : "r"(a01), "r"(a23), "r"(b01), "r"(b23));
+}
+
+// The packed forward (no LSE) where its 16-byte paths apply: D a multiple of 8, Sk of 8, rows 16-byte aligned. A warp
+// owns 32 query rows, 8 per quad-pair; a lane holds its query row's A fragments, two rows of S and O.
+template <int D, int BQ, int BK>
+__global__ __launch_bounds__(BQ / 32 * WARP) void volta_mma884_packed_kernel(
+    const __half* __restrict__ q, const __half* __restrict__ k, const __half* __restrict__ v,
+    const __half* __restrict__ bias, const uint8_t* __restrict__ kmask, __half* __restrict__ out, int N, int H,
+    int Sq, int Sk, float sm_scale, AttnLayout L) {
+    constexpr int NWARP = BQ / 32, TPB = NWARP * WARP;
+    constexpr int NK = BK / 8, ND = D / 8, KST = D / 4; // key sub-tiles, output sub-tiles, Q K^T steps
+    // rows padded by 16 bytes; V staged transposed so a B fragment (4 keys of one column) is one 8-byte load
+    constexpr int QS_LD = D + 8, KS_LD = D + 8, VT_LD = BK + 8, BS_LD = BK + 8;
+    constexpr int NKV = (BK * D / 8 + TPB - 1) / TPB, NB = (BQ * BK / 8 + TPB - 1) / TPB;
+
+    const int lane = threadIdx.x & (WARP - 1), warp = threadIdx.x / WARP, tid = threadIdx.x;
+    const int qp = (lane >> 2) & 3, hi = lane >> 4;
+    const int qtile = blockIdx.x, h = blockIdx.y, n = blockIdx.z, q0 = qtile * BQ;
+    if (q0 >= Sq) {
+        return;
+    }
+    extern __shared__ char smem[];
+    __half* Qs = reinterpret_cast<__half*>(smem); // [BQ][QS_LD]
+    __half* Ks = Qs + BQ * QS_LD;                 // [BK][KS_LD]
+    __half* Vt = Ks + BK * KS_LD;                 // [D][VT_LD]
+    __half* Bs = Vt + D * VT_LD;                  // [BQ][BS_LD]
+
+    const long long qb = n * L.qn + h * L.qh, kb = n * L.kn + h * L.kh, ob = n * L.on + h * L.oh;
+    const long long bh = (long long)h * Sq * Sk;
+    int k_end = Sk;
+    if (L.lims != nullptr) {
+        k_end = L.lims[n];
+        if (k_end == 0 || q0 >= L.lims[N]) {
+            for (int i = tid; i < BQ * D; i += TPB) {
+                const int gq = q0 + i / D;
+                if (gq < Sq) {
+                    out[ob + gq * L.os + i % D] = __float2half(0.f);
+                }
+            }
+            return;
+        }
+    }
+
+    for (int i = tid; i < BQ * D / 8; i += TPB) {
+        const int r = i / (D / 8), c = (i - r * (D / 8)) * 8, gq = q0 + r;
+        *reinterpret_cast<uint4*>(Qs + r * QS_LD + c) =
+            gq < Sq ? *reinterpret_cast<const uint4*>(q + qb + gq * L.qs + c) : make_uint4(0, 0, 0, 0);
+    }
+    __syncthreads();
+    const int wrow = warp * 32 + qp * 8;   // this quad-pair's 8 query rows within the block
+    const int ra = (lane & 3) + 4 * hi;    // A row / B column within 8
+    const int rx = (lane & 1) + 4 * hi;    // accumulator rows rx, rx + 2
+    const int cx = lane & 2;               // accumulator columns cx + {0, 1, 4, 5}
+    uint2 qa[KST];
+#pragma unroll
+    for (int ks = 0; ks < KST; ++ks) {
+        qa[ks] = *reinterpret_cast<const uint2*>(Qs + (wrow + ra) * QS_LD + ks * 4);
+    }
+
+    float o[ND][8];
+#pragma unroll
+    for (int d = 0; d < ND; ++d)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            o[d][i] = 0.f;
+        }
+    float m_run[2] = {-INFINITY, -INFINITY}, l_run[2] = {0.f, 0.f};
+    const float qk_scale = sm_scale * LOG2E;
+
+    uint4 kvec[NKV], vvec[NKV], bvec[NB];
+    const auto fetch = [&](int k0) {
+#pragma unroll
+        for (int t = 0; t < NKV; ++t) {
+            const int i = tid + t * TPB, r = i / (D / 8), c = (i - r * (D / 8)) * 8, gk = k0 + r;
+            const bool ok = i < BK * D / 8 && gk < Sk;
+            kvec[t] = ok ? *reinterpret_cast<const uint4*>(k + kb + gk * L.ks + c) : make_uint4(0, 0, 0, 0);
+            vvec[t] = ok ? *reinterpret_cast<const uint4*>(v + kb + gk * L.ks + c) : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int t = 0; t < NB; ++t) {
+            const int i = tid + t * TPB, r = i / (BK / 8), c = (i - r * (BK / 8)) * 8, gr = q0 + r, gk = k0 + c;
+            const bool ok = i < BQ * BK / 8 && gr < Sq && gk < Sk;
+            bvec[t] = ok ? *reinterpret_cast<const uint4*>(bias + bh + (long long)gr * Sk + gk) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    const auto store = [&]() {
+#pragma unroll
+        for (int t = 0; t < NKV; ++t) {
+            const int i = tid + t * TPB, r = i / (D / 8), c = (i - r * (D / 8)) * 8;
+            if (i < BK * D / 8) {
+                *reinterpret_cast<uint4*>(Ks + r * KS_LD + c) = kvec[t];
+                const __half* vh = reinterpret_cast<const __half*>(&vvec[t]);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    Vt[(c + j) * VT_LD + r] = vh[j];
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < NB; ++t) {
+            const int i = tid + t * TPB, r = i / (BK / 8), c = (i - r * (BK / 8)) * 8;
+            if (i < BQ * BK / 8) {
+                *reinterpret_cast<uint4*>(Bs + r * BS_LD + c) = bvec[t];
+            }
+        }
+    };
+
+    const int t4 = lane & 3, src0 = (lane & ~3) | (t4 & 1), src1 = src0 | 2, tslot = t4 >> 1;
+    fetch(0);
+    for (int k0 = 0; k0 < k_end; k0 += BK) {
+        __syncthreads();
+        store();
+        __syncthreads();
+        if (k0 + BK < k_end) {
+            fetch(k0 + BK);
+        }
+
+        // S = Q K^T: B fragment = 4 head columns of key ra
+        float s[NK][8];
+#pragma unroll
+        for (int nt = 0; nt < NK; ++nt) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                s[nt][i] = 0.f;
+            }
+#pragma unroll
+            for (int ks = 0; ks < KST; ++ks) {
+                const uint2 b = *reinterpret_cast<const uint2*>(Ks + (nt * 8 + ra) * KS_LD + ks * 4);
+                mma884(s[nt], qa[ks].x, qa[ks].y, b.x, b.y);
+            }
+        }
+
+        // scale, bias, mask (a masked key MASKED_LOGIT, one past Sk -inf, a row past Sq all masked); row max over the
+        // two lanes holding a row (lane ^ 2)
+        float m_tile[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int nt = 0; nt < NK; ++nt) {
+            const int kc = k0 + nt * 8;
+            const bool in = kc < Sk; // Sk % 8 == 0: a sub-tile is all in or all out
+            const uint32_t mk0 = in ? *reinterpret_cast<const uint16_t*>(kmask + (long long)n * Sk + kc + cx) : 0u;
+            const uint32_t mk1 = in ? *reinterpret_cast<const uint16_t*>(kmask + (long long)n * Sk + kc + cx + 4) : 0u;
+#pragma unroll
+            for (int sl = 0; sl < 2; ++sl) {
+                const int row = wrow + rx + 2 * sl;
+                const bool row_ok = q0 + row < Sq;
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh) {
+                    const __half2 b2 = *reinterpret_cast<const __half2*>(Bs + row * BS_LD + nt * 8 + hh * 4 + cx);
+                    const uint32_t mk = hh ? mk1 : mk0;
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) {
+                        const int i = (hh << 2) | (sl << 1) | j;
+                        const bool keep = row_ok && in && ((mk >> (8 * j)) & 0xff) != 0;
+                        const float b = __half2float(j ? __high2half(b2) : __low2half(b2));
+                        s[nt][i] = keep ? s[nt][i] * qk_scale + b * LOG2E
+                                        : ((!in && row_ok) ? -INFINITY : MASKED_LOGIT * LOG2E);
+                        m_tile[sl] = fmaxf(m_tile[sl], s[nt][i]);
+                    }
+                }
+            }
+        }
+        float m_new[2], alpha[2];
+        bool raise_any = false;
+#pragma unroll
+        for (int sl = 0; sl < 2; ++sl) {
+            m_tile[sl] = fmaxf(m_tile[sl], __shfl_xor_sync(0xffffffffu, m_tile[sl], 2));
+            // lazy rescale (FlashMLA's rule): the max moves only when a tile raises it past 2^6
+            const bool raise = m_tile[sl] > m_run[sl] + 6.f;
+            m_new[sl] = raise ? fmaxf(m_run[sl], m_tile[sl]) : m_run[sl];
+            alpha[sl] = raise ? ex2_ftz(m_run[sl] - m_new[sl]) : 1.f;
+            raise_any |= raise;
+        }
+
+        // P = exp2(S - m) as half pairs pp[nt][slot][half] (columns half * 4 + cx + {0, 1}), and the row sums
+        uint32_t pp[NK][2][2];
+        float l_tile[2] = {0.f, 0.f};
+#pragma unroll
+        for (int nt = 0; nt < NK; ++nt)
+#pragma unroll
+            for (int sl = 0; sl < 2; ++sl)
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh) {
+                    const int i = (hh << 2) | (sl << 1);
+                    const float e0 = ex2_ftz(s[nt][i] - m_new[sl]), e1 = ex2_ftz(s[nt][i + 1] - m_new[sl]);
+                    l_tile[sl] += e0 + e1;
+                    const __half2 e = __floats2half2_rn(e0, e1);
+                    pp[nt][sl][hh] = reinterpret_cast<const uint32_t&>(e);
+                }
+#pragma unroll
+        for (int sl = 0; sl < 2; ++sl) {
+            l_tile[sl] += __shfl_xor_sync(0xffffffffu, l_tile[sl], 2);
+            l_run[sl] = l_run[sl] * alpha[sl] + l_tile[sl];
+            m_run[sl] = m_new[sl];
+        }
+        if (raise_any) {
+#pragma unroll
+            for (int d = 0; d < ND; ++d)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    o[d][i] *= alpha[(i >> 1) & 1];
+                }
+        }
+
+        // O += P V. P's A fragment (row t4 + 4 hi, 4 keys) from the accumulator layout: its keys 0-1 sit in lane
+        // src0, 2-3 in src1, in row slot tslot, so 4 shuffles a step within the quad
+#pragma unroll
+        for (int nt = 0; nt < NK; ++nt)
+#pragma unroll
+            for (int hh = 0; hh < 2; ++hh) {
+                const uint32_t x0 = __shfl_sync(0xffffffffu, pp[nt][0][hh], src0);
+                const uint32_t x1 = __shfl_sync(0xffffffffu, pp[nt][1][hh], src0);
+                const uint32_t y0 = __shfl_sync(0xffffffffu, pp[nt][0][hh], src1);
+                const uint32_t y1 = __shfl_sync(0xffffffffu, pp[nt][1][hh], src1);
+                const uint32_t a01 = tslot ? x1 : x0, a23 = tslot ? y1 : y0;
+#pragma unroll
+                for (int d = 0; d < ND; ++d) {
+                    const uint2 b = *reinterpret_cast<const uint2*>(Vt + (d * 8 + ra) * VT_LD + nt * 8 + hh * 4);
+                    mma884(o[d], a01, a23, b.x, b.y);
+                }
+            }
+    }
+
+#pragma unroll
+    for (int sl = 0; sl < 2; ++sl) {
+        const int gq = q0 + wrow + rx + 2 * sl;
+        if (gq >= Sq) {
+            continue;
+        }
+        const float inv = 1.0f / fmaxf(l_run[sl], 1e-30f);
+#pragma unroll
+        for (int d = 0; d < ND; ++d)
+#pragma unroll
+            for (int hh = 0; hh < 2; ++hh)
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const int col = d * 8 + hh * 4 + cx + j;
+                    out[ob + gq * L.os + col] = __float2half(
+                        L.apply_gate(o[d][(hh << 2) | (sl << 1) | j] * inv, qb + gq * L.qs + col, h, col, D));
+                }
+    }
+}
+
+template <int D, int BQ, int BK>
+static ffi::Error launch_mma884(cudaStream_t stream, int device, const __half* q, const __half* k, const __half* v,
+                                const __half* bias, const uint8_t* kmask, __half* out, int N, int H, int Sq, int Sk,
+                                float scale, const AttnLayout& L) {
+    constexpr size_t smem = (size_t)(BQ * (D + 8) + BK * (D + 8) + D * (BK + 8) + BQ * (BK + 8)) * sizeof(__half);
+    auto kern = volta_mma884_packed_kernel<D, BQ, BK>;
+    if (smem > 48 * 1024 && needs_smem_optin(device, (const void*)kern)) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    }
+    dim3 grid((Sq + BQ - 1) / BQ, H, N);
+    kern<<<grid, BQ / 32 * WARP, smem, stream>>>(q, k, v, bias, kmask, out, N, H, Sq, Sk, scale, L);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        return ffi::Error::Internal(std::string("volta_mma884 launch: ") + cudaGetErrorString(err));
+    }
+    return ffi::Error::Success();
+}
+
+// the m8n8k4 kernel where it applies (VOLTA_ATTN_WMMA=1 keeps the wmma one, for comparisons); false: use wmma
+static bool mma884_packed(cudaStream_t stream, int device, const __half* q, const __half* k, const __half* v,
+                          const __half* bias, const uint8_t* kmask, __half* out, int N, int H, int S, int D,
+                          const AttnLayout& L, float scale, int64_t block_q, int64_t block_k, ffi::Error* err) {
+    static const bool off = [] { const char* e = getenv("VOLTA_ATTN_WMMA"); return e && e[0] == '1'; }();
+    const auto a16 = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; };
+    if (off || S % 8 != 0 || L.qs % 8 != 0 || L.ks % 8 != 0 || L.qh % 8 != 0 || L.kh % 8 != 0 || !a16(q) ||
+        !a16(k) || !a16(v) || !a16(bias)) {
+        return false;
+    }
+#define DISPATCH884(DD, BQ, BK)                                                                                      \
+    if (D == (DD) && block_q == (BQ) && block_k == (BK)) {                                                          \
+        *err = launch_mma884<DD, BQ, BK>(stream, device, q, k, v, bias, kmask, out, N, H, S, S, scale, L);          \
+        return true;                                                                                                \
+    }
+    DISPATCH884(32, 64, 32) DISPATCH884(32, 64, 64) DISPATCH884(32, 128, 32) DISPATCH884(32, 128, 64)
+    DISPATCH884(8, 64, 32) DISPATCH884(8, 64, 64) DISPATCH884(8, 128, 64)
+    DISPATCH884(16, 64, 32) DISPATCH884(16, 64, 64) DISPATCH884(64, 64, 32) // (64, 64, 64) spills: wmma
+#undef DISPATCH884
+    return false;
+}
+
 // Forward only, as VoltaMmaPacked: q/k/v (and the gate when G == 4) read in place from p.
 static ffi::Error VoltaWmmaPackedImpl(const int* lims, cudaStream_t stream, int32_t device,
                                ffi::Buffer<ffi::DataType::F16> p,
@@ -430,6 +724,12 @@ static ffi::Error VoltaWmmaPackedImpl(const int* lims, cudaStream_t stream, int3
     if (bias.element_count() != (size_t)H * S * S || kmask.element_count() != (size_t)N * S ||
         (G == 4 && gate_bias.element_count() != (size_t)H * D)) {
         return ffi::Error::InvalidArgument("bias must be [H,S,S], kmask [N,S], gate_bias [H,D]");
+    }
+    ffi::Error err = ffi::Error::Success();
+    if (mma884_packed(stream, device, pp, pp + H * D, pp + 2 * H * D, reinterpret_cast<const __half*>(bias.typed_data()),
+                      kmask.typed_data(), reinterpret_cast<__half*>(out->typed_data()), N, H, S, D, L, scale, block_q,
+                      block_k, &err)) {
+        return err;
     }
     return volta_wmma_common<false>(stream, device, pp, pp + H * D, pp + 2 * H * D,
                                     reinterpret_cast<const __half*>(bias.typed_data()),
