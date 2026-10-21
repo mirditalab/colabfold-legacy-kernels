@@ -162,43 +162,91 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
     const bool vec_kv = L.ks % 8 == 0 && kb % 8 == 0 && aligned(k) && aligned(v);
     const bool vec_b = Sk % 8 == 0 && aligned(bias);
 
+    // both 16-byte paths: the next tile's K, V and bias are loaded into registers while this one computes, so the
+    // loads' latency overlaps the MMAs instead of stalling every thread between the two barriers
+    constexpr int NT = NWARP * WARP, NKV = (BK * D / 8 + NT - 1) / NT, NB = (BQ * BK / 8 + NT - 1) / NT;
+    const bool pipe = vec_kv && vec_b;
+    uint4 kreg[NKV], vreg[NKV], breg[NB];
+    const auto fetch = [&](int k0) {
+#pragma unroll
+        for (int i = 0; i < NKV; ++i) {
+            const int x = tid + i * NT, r = x / (D / 8), c = (x - r * (D / 8)) * 8, gk = k0 + r;
+            const bool ok = x < BK * D / 8 && gk < Sk;
+            kreg[i] = ok ? ldg16(k + kb + gk * L.ks + c) : make_uint4(0, 0, 0, 0);
+            vreg[i] = ok ? ldg16(v + kb + gk * L.ks + c) : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int i = 0; i < NB; ++i) {
+            const int x = tid + i * NT, r = x / (BK / 8), c = (x - r * (BK / 8)) * 8, gq = q0 + r, gk = k0 + c;
+            const bool ok = x < BQ * BK / 8 && gq < Sq && gk < Sk;
+            breg[i] = ok ? ldg16(bias + bh + (long long)gq * Sk + gk) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    const auto store = [&]() {
+#pragma unroll
+        for (int i = 0; i < NKV; ++i) {
+            const int x = tid + i * NT, r = x / (D / 8), c = (x - r * (D / 8)) * 8;
+            if (x < BK * D / 8) {
+                *reinterpret_cast<uint4*>(Ks + r * DS + c) = kreg[i];
+                *reinterpret_cast<uint4*>(Vs + r * DS + c) = vreg[i];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < NB; ++i) {
+            const int x = tid + i * NT, r = x / (BK / 8), c = (x - r * (BK / 8)) * 8;
+            if (x < BQ * BK / 8) {
+                *reinterpret_cast<uint4*>(Bs + r * BS + c) = breg[i];
+            }
+        }
+    };
+    if (pipe) {
+        fetch(0);
+    }
+
     for (int k0 = 0; k0 < k_end; k0 += BK) {
         __syncthreads();
-        if (vec_kv) {
-            for (int i = tid; i < BK * D / 8; i += nthreads) {
-                const int r = i / (D / 8), c = (i - r * (D / 8)) * 8, gk = k0 + r;
-                uint4 kx = make_uint4(0, 0, 0, 0), vx = kx;
-                if (gk < Sk) {
-                    kx = ldg16(k + kb + gk * L.ks + c);
-                    vx = ldg16(v + kb + gk * L.ks + c);
+        if (pipe) {
+            store();
+        } else {
+            if (vec_kv) {
+                for (int i = tid; i < BK * D / 8; i += nthreads) {
+                    const int r = i / (D / 8), c = (i - r * (D / 8)) * 8, gk = k0 + r;
+                    uint4 kx = make_uint4(0, 0, 0, 0), vx = kx;
+                    if (gk < Sk) {
+                        kx = ldg16(k + kb + gk * L.ks + c);
+                        vx = ldg16(v + kb + gk * L.ks + c);
+                    }
+                    *reinterpret_cast<uint4*>(Ks + r * DS + c) = kx;
+                    *reinterpret_cast<uint4*>(Vs + r * DS + c) = vx;
                 }
-                *reinterpret_cast<uint4*>(Ks + r * DS + c) = kx;
-                *reinterpret_cast<uint4*>(Vs + r * DS + c) = vx;
+            } else {
+                for (int i = tid; i < BK * D; i += nthreads) {
+                    int r = i / D, c = i - r * D;
+                    int gk = k0 + r;
+                    bool ok = (gk < Sk);
+                    Ks[r * DS + c] = ok ? k[kb + gk * L.ks + c] : __float2half(0.f);
+                    Vs[r * DS + c] = ok ? v[kb + gk * L.ks + c] : __float2half(0.f);
+                }
             }
-        } else {
-            for (int i = tid; i < BK * D; i += nthreads) {
-                int r = i / D, c = i - r * D;
-                int gk = k0 + r;
-                bool ok = (gk < Sk);
-                Ks[r * DS + c] = ok ? k[kb + gk * L.ks + c] : __float2half(0.f);
-                Vs[r * DS + c] = ok ? v[kb + gk * L.ks + c] : __float2half(0.f);
-            }
-        }
-        if (vec_b) {
-            for (int i = tid; i < BQ * BK / 8; i += nthreads) {
-                const int r = i / (BK / 8), c = (i - r * (BK / 8)) * 8, gq = q0 + r, gk = k0 + c;
-                const uint4 bx = (gq < Sq && gk < Sk) ? ldg16(bias + bh + (long long)gq * Sk + gk)
-                                                      : make_uint4(0, 0, 0, 0);
-                *reinterpret_cast<uint4*>(Bs + r * BS + c) = bx;
-            }
-        } else {
-            for (int i = tid; i < BQ * BK; i += nthreads) { // coalesced bias staging
-                int r = i / BK, c = i - r * BK;
-                int gq = q0 + r, gk = k0 + c;
-                Bs[r * BS + c] = (gq < Sq && gk < Sk) ? bias[bh + (long long)gq * Sk + gk] : __float2half(0.f);
+            if (vec_b) {
+                for (int i = tid; i < BQ * BK / 8; i += nthreads) {
+                    const int r = i / (BK / 8), c = (i - r * (BK / 8)) * 8, gq = q0 + r, gk = k0 + c;
+                    const uint4 bx = (gq < Sq && gk < Sk) ? ldg16(bias + bh + (long long)gq * Sk + gk)
+                                                          : make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4*>(Bs + r * BS + c) = bx;
+                }
+            } else {
+                for (int i = tid; i < BQ * BK; i += nthreads) { // coalesced bias staging
+                    int r = i / BK, c = i - r * BK;
+                    int gq = q0 + r, gk = k0 + c;
+                    Bs[r * BS + c] = (gq < Sq && gk < Sk) ? bias[bh + (long long)gq * Sk + gk] : __float2half(0.f);
+                }
             }
         }
         __syncthreads();
+        if (pipe && k0 + BK < k_end) {
+            fetch(k0 + BK);
+        }
 
         // S = Q @ K^T, then softmax, entirely in registers
         FragC s[NK];
