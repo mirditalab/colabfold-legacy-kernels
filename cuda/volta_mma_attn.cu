@@ -206,7 +206,15 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
     constexpr int NT = NWARP * WARP, NKV = (BK * D / 8 + NT - 1) / NT, NB = (BQ * BK / 8 + NT - 1) / NT;
     const bool pipe = vec_kv && vec_b;
     uint4 kreg[NKV], vreg[NKV], breg[NB];
+    // and this lane's key-mask bytes (keys lc, lc+1 of each 8-key sub-tile), one tile ahead like K: a mask load right
+    // before its use was the kernel's largest stall; Sk % 8 == 0 here, so a sub-tile is all in or all out
+    uint32_t mnext[NK], mcur[NK];
     const auto fetch = [&](int k0) {
+#pragma unroll
+        for (int nt = 0; nt < NK; ++nt) {
+            const int col0 = k0 + nt * MMA_N + lc;
+            mnext[nt] = col0 < Sk ? *reinterpret_cast<const uint16_t*>(kmask + (long long)n * Sk + col0) : 0u;
+        }
 #pragma unroll
         for (int i = 0; i < NKV; ++i) {
             const int x = tid + i * NT, r = x / (D / 8), c = (x - r * (D / 8)) * 8, gk = k0 + r;
@@ -222,6 +230,10 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
         }
     };
     const auto store = [&]() {
+#pragma unroll
+        for (int nt = 0; nt < NK; ++nt) {
+            mcur[nt] = mnext[nt];
+        }
 #pragma unroll
         for (int i = 0; i < NKV; ++i) {
             const int x = tid + i * NT, r = x / (D / 8), c = (x - r * (D / 8)) * 8;
@@ -316,7 +328,9 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
             const int col0 = k0 + nt * MMA_N + lc;
             // the two keys' mask bytes in one load where they are 2-byte aligned
             uint32_t mk = 0;
-            if (Sk % 2 == 0 && col0 + 1 < Sk) {
+            if (pipe) {
+                mk = mcur[nt];
+            } else if (Sk % 2 == 0 && col0 + 1 < Sk) {
                 mk = *reinterpret_cast<const uint16_t*>(kmask + (long long)n * Sk + col0);
             } else {
                 mk = (col0 < Sk ? kmask[(long long)n * Sk + col0] : 0) |
