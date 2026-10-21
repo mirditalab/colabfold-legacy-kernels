@@ -5,6 +5,7 @@
 
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <type_traits>
 #include <string>
 
 #include "cutlass/cutlass.h"
@@ -323,33 +324,47 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
             const int m = lane / 8; // matrix m: key sub-tile nt + m/2, rows half m%2
             ldsm<4, false>(bf + 2 * nt, Bs + (warp * MMA_M + (m % 2) * 8 + (lane & 7)) * BS + (nt + m / 2) * MMA_N);
         }
+        // this lane's mask bytes for keys lc, lc+1 of each 8-key sub-tile (2 per load where 2-byte aligned)
+        uint32_t mk[NK];
+        bool kept = true;
 #pragma unroll
         for (int nt = 0; nt < NK; ++nt) {
             const int col0 = k0 + nt * MMA_N + lc;
-            // the two keys' mask bytes in one load where they are 2-byte aligned
-            uint32_t mk = 0;
             if (pipe) {
-                mk = mcur[nt];
+                mk[nt] = mcur[nt];
             } else if (Sk % 2 == 0 && col0 + 1 < Sk) {
-                mk = *reinterpret_cast<const uint16_t*>(kmask + (long long)n * Sk + col0);
+                mk[nt] = *reinterpret_cast<const uint16_t*>(kmask + (long long)n * Sk + col0);
             } else {
-                mk = (col0 < Sk ? kmask[(long long)n * Sk + col0] : 0) |
-                     (col0 + 1 < Sk ? kmask[(long long)n * Sk + col0 + 1] : 0) << 8;
+                mk[nt] = (col0 < Sk ? kmask[(long long)n * Sk + col0] : 0) |
+                         (col0 + 1 < Sk ? kmask[(long long)n * Sk + col0 + 1] : 0) << 8;
             }
+            kept = kept && col0 + 1 < Sk && (mk[nt] & 0xff) && (mk[nt] >> 8);
+        }
+        // scale + bias, and mask where any key of the warp's tile is masked or past Sk (a masked key takes
+        // MASKED_LOGIT, a key past Sk -inf); a warp with every key kept skips the per-logit select
+        const auto scores = [&](auto masked) {
 #pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                const int col = col0 + j;
-                const bool in = col < Sk;
-                const bool keep = in && ((mk >> (8 * j)) & 0xff) != 0;
-                const float fill = in ? MASKED_LOGIT * LOG2E : -INFINITY;
+            for (int nt = 0; nt < NK; ++nt) {
 #pragma unroll
-                for (int half_i = 0; half_i < 2; ++half_i) {
-                    const __half b = reinterpret_cast<const __half*>(&bf[2 * nt + half_i])[j];
-                    const float val = s[nt][half_i * 2 + j] * qk_scale + __half2float(b) * LOG2E;
-                    s[nt][half_i * 2 + j] = keep ? val : fill;
-                    m_tile[half_i] = fmaxf(m_tile[half_i], s[nt][half_i * 2 + j]);
+                for (int j = 0; j < 2; ++j) {
+                    const int col = k0 + nt * MMA_N + lc + j;
+                    const bool in = col < Sk;
+                    const bool keep = in && ((mk[nt] >> (8 * j)) & 0xff) != 0;
+                    const float fill = in ? MASKED_LOGIT * LOG2E : -INFINITY;
+#pragma unroll
+                    for (int half_i = 0; half_i < 2; ++half_i) {
+                        const __half b = reinterpret_cast<const __half*>(&bf[2 * nt + half_i])[j];
+                        const float val = s[nt][half_i * 2 + j] * qk_scale + __half2float(b) * LOG2E;
+                        s[nt][half_i * 2 + j] = (!decltype(masked)::value || keep) ? val : fill;
+                        m_tile[half_i] = fmaxf(m_tile[half_i], s[nt][half_i * 2 + j]);
+                    }
                 }
             }
+        };
+        if (__all_sync(0xffffffffu, kept)) {
+            scores(std::false_type{});
+        } else {
+            scores(std::true_type{});
         }
 // the 8 columns of a row live in lanes {4r..4r+3}
 #pragma unroll
