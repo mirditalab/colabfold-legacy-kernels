@@ -83,6 +83,8 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
     constexpr int NK = BK / MMA_N;   // key sub-tiles per BK tile
     constexpr int ND = D / MMA_N;    // output dim sub-tiles
     constexpr int KSTEP = D / MMA_K; // contraction steps for Q@K^T
+    // shared rows padded by 16 bytes: a fragment's 8 rows fall in different banks (a 64-byte stride put them in 2)
+    constexpr int DS = D + 8, BS = BK + 8;
 
     const int lane = threadIdx.x & (WARP - 1);
     const int warp = threadIdx.x / WARP;
@@ -103,9 +105,9 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
 
     extern __shared__ char smem[];
     __half* Qs = reinterpret_cast<__half*>(smem); // [BQ][D]
-    __half* Ks = Qs + BQ * D;                     // [BK][D]
-    __half* Vs = Ks + BK * D;                     // [BK][D]
-    __half* Bs = Vs + BK * D;                     // [BQ][BK] bias tile
+    __half* Ks = Qs + BQ * D;                     // [BK][DS]
+    __half* Vs = Ks + BK * DS;                    // [BK][DS]
+    __half* Bs = Vs + BK * DS;                    // [BQ][BS] bias tile
 
     const long long qb = n * L.qn + h * L.qh, kb = n * L.kn + h * L.kh, ob = n * L.on + h * L.oh;
     const long long bh = (long long)h * Sq * Sk;
@@ -170,16 +172,16 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
                     kx = ldg16(k + kb + gk * L.ks + c);
                     vx = ldg16(v + kb + gk * L.ks + c);
                 }
-                *reinterpret_cast<uint4*>(Ks + r * D + c) = kx;
-                *reinterpret_cast<uint4*>(Vs + r * D + c) = vx;
+                *reinterpret_cast<uint4*>(Ks + r * DS + c) = kx;
+                *reinterpret_cast<uint4*>(Vs + r * DS + c) = vx;
             }
         } else {
             for (int i = tid; i < BK * D; i += nthreads) {
                 int r = i / D, c = i - r * D;
                 int gk = k0 + r;
                 bool ok = (gk < Sk);
-                Ks[i] = ok ? k[kb + gk * L.ks + c] : __float2half(0.f);
-                Vs[i] = ok ? v[kb + gk * L.ks + c] : __float2half(0.f);
+                Ks[r * DS + c] = ok ? k[kb + gk * L.ks + c] : __float2half(0.f);
+                Vs[r * DS + c] = ok ? v[kb + gk * L.ks + c] : __float2half(0.f);
             }
         }
         if (vec_b) {
@@ -187,13 +189,13 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
                 const int r = i / (BK / 8), c = (i - r * (BK / 8)) * 8, gq = q0 + r, gk = k0 + c;
                 const uint4 bx = (gq < Sq && gk < Sk) ? ldg16(bias + bh + (long long)gq * Sk + gk)
                                                       : make_uint4(0, 0, 0, 0);
-                *reinterpret_cast<uint4*>(Bs + r * BK + c) = bx;
+                *reinterpret_cast<uint4*>(Bs + r * BS + c) = bx;
             }
         } else {
             for (int i = tid; i < BQ * BK; i += nthreads) { // coalesced bias staging
                 int r = i / BK, c = i - r * BK;
                 int gq = q0 + r, gk = k0 + c;
-                Bs[i] = (gq < Sq && gk < Sk) ? bias[bh + (long long)gq * Sk + gk] : __float2half(0.f);
+                Bs[r * BS + c] = (gq < Sq && gk < Sk) ? bias[bh + (long long)gq * Sk + gk] : __float2half(0.f);
             }
         }
         __syncthreads();
@@ -208,11 +210,8 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
                 // B is column-major (k x n): lane t holds k=(t%4)*2+{0,1}, n=t/4.
                 // Here k indexes head-dim and n indexes key, so B[k][n] = K[key][dim].
                 FragB fb;
-#pragma unroll
-                for (int j = 0; j < 2; ++j) {
-                    fb[j] = reinterpret_cast<cutlass::half_t&>(
-                        Ks[(nt * MMA_N + lr) * D + ks * MMA_K + lc + j]);
-                }
+                *reinterpret_cast<uint32_t*>(&fb) =
+                    *reinterpret_cast<const uint32_t*>(Ks + (nt * MMA_N + lr) * DS + ks * MMA_K + lc);
                 mma_op(s[nt], fq[ks], fb, s[nt]);
             }
         }
@@ -231,7 +230,7 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
                 for (int half_i = 0; half_i < 2; ++half_i) {
                     const int r_loc = warp * MMA_M + lr + half_i * 8;
                     const float val = s[nt][half_i * 2 + j] * qk_scale +
-                                      __half2float(Bs[r_loc * BK + nt * MMA_N + lc + j]) * LOG2E;
+                                      __half2float(Bs[r_loc * BS + nt * MMA_N + lc + j]) * LOG2E;
                     s[nt][half_i * 2 + j] = keep ? val : fill;
                     m_tile[half_i] = fmaxf(m_tile[half_i], s[nt][half_i * 2 + j]);
                 }
@@ -294,7 +293,7 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
 #pragma unroll
                 for (int j = 0; j < 2; ++j) {
                     fv[j] = reinterpret_cast<cutlass::half_t&>(
-                        Vs[(nt * MMA_N + lc + j) * D + d * MMA_N + lr]);
+                        Vs[(nt * MMA_N + lc + j) * DS + d * MMA_N + lr]);
                 }
                 mma_op(acc[d], p[nt], fv, acc[d]);
             }
@@ -344,7 +343,7 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
                          float* lse, int N, int H, int Sq, int Sk, float scale,
                          const AttnLayout& L) {
     constexpr int NWARP = BQ / MMA_M;
-    constexpr size_t smem = (size_t)(BQ * D + 2 * BK * D + BQ * BK) * sizeof(__half);
+    constexpr size_t smem = (size_t)(BQ * D + 2 * BK * (D + 8) + BQ * (BK + 8)) * sizeof(__half);
     auto kern = volta_mma_kernel<D, BQ, BK, WANT_LSE>;
 
     // Read the device limit one time only.
