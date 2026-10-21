@@ -72,6 +72,45 @@ __device__ __forceinline__ uint4 ldg16(const __half* p) {
     return r;
 }
 
+// ldmatrix: N 8x8 b16 matrices from shared memory, lanes 8m..8m+7 giving matrix m's row addresses; a lane gets row
+// lane/4, columns 2*(lane%4)+{0,1} of each (TRANS: of its transpose) -- an m16n8k8 B fragment, or a C fragment's half
+template <int N, bool TRANS>
+__device__ __forceinline__ void ldsm(uint32_t* r, const __half* p) {
+    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    if constexpr (N == 4 && TRANS) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+    } else if constexpr (N == 4) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+    } else if constexpr (N == 2 && TRANS) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(a));
+    } else if constexpr (N == 2) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(a));
+    } else if constexpr (TRANS) {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%0}, [%1];" : "=r"(r[0]) : "r"(a));
+    } else {
+        asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];" : "=r"(r[0]) : "r"(a));
+    }
+}
+
+// the CNT 8x8 blocks side by side in the 8 rows at base (row stride in halves): CNT fragments, 4 per ldmatrix
+template <int CNT, bool TRANS>
+__device__ __forceinline__ void ldsm_blocks(uint32_t* r, const __half* base, int stride, int lane) {
+    const __half* row = base + (lane & 7) * stride;
+#pragma unroll
+    for (int g = 0; g < CNT / 4; ++g) {
+        ldsm<4, TRANS>(r + 4 * g, row + (4 * g + lane / 8) * 8);
+    }
+    constexpr int G = CNT / 4 * 4;
+    if constexpr (CNT % 4 >= 2) {
+        ldsm<2, TRANS>(r + G, row + (G + (lane / 8) % 2) * 8);
+    }
+    if constexpr (CNT % 2 == 1) {
+        ldsm<1, TRANS>(r + CNT - 1, row + (CNT - 1) * 8);
+    }
+}
+
 // BQ must be a multiple of 16 (one warp owns MMA_M=16 query rows).
 // BK and D must be multiples of 8.
 template <int D, int BQ, int BK, bool WANT_LSE>
@@ -253,32 +292,46 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
 #pragma unroll
         for (int nt = 0; nt < NK; ++nt) {
             s[nt].clear();
+            // B[k][n] = K[key][dim]: the 8 keys' rows, one 8x8 block per contraction step
+            uint32_t kf[KSTEP];
+            ldsm_blocks<KSTEP, false>(kf, Ks + nt * MMA_N * DS, DS, lane);
 #pragma unroll
             for (int ks = 0; ks < KSTEP; ++ks) {
-                // B is column-major (k x n): lane t holds k=(t%4)*2+{0,1}, n=t/4.
-                // Here k indexes head-dim and n indexes key, so B[k][n] = K[key][dim].
-                FragB fb;
-                *reinterpret_cast<uint32_t*>(&fb) =
-                    *reinterpret_cast<const uint32_t*>(Ks + (nt * MMA_N + lr) * DS + ks * MMA_K + lc);
-                mma_op(s[nt], fq[ks], fb, s[nt]);
+                mma_op(s[nt], fq[ks], reinterpret_cast<FragB&>(kf[ks]), s[nt]);
             }
         }
 
         // scale + bias + mask without branches: a masked key takes MASKED_LOGIT, a key past Sk -inf
         float m_tile[2] = {-INFINITY, -INFINITY};
+        // the bias of this warp's 16 rows, 2 key sub-tiles per ldmatrix: bf[2 nt + half_i] holds columns lc, lc+1
+        static_assert(NK % 2 == 0, "bias fragments load 2 key sub-tiles at a time");
+        uint32_t bf[2 * NK];
+#pragma unroll
+        for (int nt = 0; nt < NK; nt += 2) {
+            const int m = lane / 8; // matrix m: key sub-tile nt + m/2, rows half m%2
+            ldsm<4, false>(bf + 2 * nt, Bs + (warp * MMA_M + (m % 2) * 8 + (lane & 7)) * BS + (nt + m / 2) * MMA_N);
+        }
 #pragma unroll
         for (int nt = 0; nt < NK; ++nt) {
+            const int col0 = k0 + nt * MMA_N + lc;
+            // the two keys' mask bytes in one load where they are 2-byte aligned
+            uint32_t mk = 0;
+            if (Sk % 2 == 0 && col0 + 1 < Sk) {
+                mk = *reinterpret_cast<const uint16_t*>(kmask + (long long)n * Sk + col0);
+            } else {
+                mk = (col0 < Sk ? kmask[(long long)n * Sk + col0] : 0) |
+                     (col0 + 1 < Sk ? kmask[(long long)n * Sk + col0 + 1] : 0) << 8;
+            }
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
-                const int col = k0 + nt * MMA_N + lc + j;
+                const int col = col0 + j;
                 const bool in = col < Sk;
-                const bool keep = in && kmask[(long long)n * Sk + (in ? col : Sk - 1)] != 0;
+                const bool keep = in && ((mk >> (8 * j)) & 0xff) != 0;
                 const float fill = in ? MASKED_LOGIT * LOG2E : -INFINITY;
 #pragma unroll
                 for (int half_i = 0; half_i < 2; ++half_i) {
-                    const int r_loc = warp * MMA_M + lr + half_i * 8;
-                    const float val = s[nt][half_i * 2 + j] * qk_scale +
-                                      __half2float(Bs[r_loc * BS + nt * MMA_N + lc + j]) * LOG2E;
+                    const __half b = reinterpret_cast<const __half*>(&bf[2 * nt + half_i])[j];
+                    const float val = s[nt][half_i * 2 + j] * qk_scale + __half2float(b) * LOG2E;
                     s[nt][half_i * 2 + j] = keep ? val : fill;
                     m_tile[half_i] = fmaxf(m_tile[half_i], s[nt][half_i * 2 + j]);
                 }
@@ -324,26 +377,24 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
         }
 
 // O = O*alpha + P @ V
+        if (raise) {
 #pragma unroll
-        for (int d = 0; d < ND; ++d) {
-            if (raise) {
+            for (int d = 0; d < ND; ++d)
 #pragma unroll
                 for (int half_i = 0; half_i < 2; ++half_i)
 #pragma unroll
                     for (int j = 0; j < 2; ++j) {
                         acc[d][half_i * 2 + j] *= alpha[half_i];
                     }
-            }
+        }
 #pragma unroll
-            for (int nt = 0; nt < NK; ++nt) {
-                // B[k][n] = V[key][dim]; lane holds k=(t%4)*2+{0,1}, n=t/4
-                FragB fv;
+        for (int nt = 0; nt < NK; ++nt) {
+            // B[k][n] = V[key][dim]: the transpose of the 8 keys' rows, one 8x8 block per output sub-tile
+            uint32_t vf[ND];
+            ldsm_blocks<ND, true>(vf, Vs + nt * MMA_N * DS, DS, lane);
 #pragma unroll
-                for (int j = 0; j < 2; ++j) {
-                    fv[j] = reinterpret_cast<cutlass::half_t&>(
-                        Vs[(nt * MMA_N + lc + j) * DS + d * MMA_N + lr]);
-                }
-                mma_op(acc[d], p[nt], fv, acc[d]);
+            for (int d = 0; d < ND; ++d) {
+                mma_op(acc[d], p[nt], reinterpret_cast<FragB&>(vf[d]), acc[d]);
             }
         }
     }
