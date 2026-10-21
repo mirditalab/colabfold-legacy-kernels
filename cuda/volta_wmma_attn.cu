@@ -54,6 +54,10 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     // The O tile comes back through this buffer too, thus D columns, not BK.
     constexpr int SS_LD = (BK > D ? BK : D) + 4; // f32 ldm: multiple of 4 for wmma stores
     constexpr int PS_LD = BK + 8; // f16 ldm: multiple of 8 for wmma loads
+    // K and V rows padded by 16 bytes (a multiple of 8 halves for wmma, rows still 32-byte aligned): at a 64-byte stride
+    // a fragment's rows fell in two bank groups
+    constexpr int KS_LD = D + 8;
+    constexpr int BS_LD = BK + 8; // the bias tile, staged with K and V
     constexpr int TPB = NWARP * WARP;
     constexpr int KV_PER_THREAD = (BK * D + TPB - 1) / TPB;
 
@@ -70,10 +74,10 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     extern __shared__ char smem[];
     float* Ss = reinterpret_cast<float*>(smem);              // [BQ][SS_LD]
     __half* Ps = reinterpret_cast<__half*>(Ss + BQ * SS_LD); // [BQ][PS_LD]
-    __half* Ks = Ps + BQ * PS_LD;                            // [BK][D]
-    __half* Vs = Ks + BK * D;                                // [BK][D]
-    float* Os = reinterpret_cast<float*>(Vs + BK * D);       // [BQ][D]
-    float* ms = Os + BQ * D;
+    __half* Ks = Ps + BQ * PS_LD;                            // [BK][KS_LD]
+    __half* Vs = Ks + BK * KS_LD;                            // [BK][KS_LD]
+    __half* Bs = Vs + BK * KS_LD;                            // [BQ][BS_LD]
+    float* ms = reinterpret_cast<float*>(Bs + BQ * BS_LD);
     float* ls = ms + BQ;
 
     const long long qb = n * L.qn + h * L.qh, kb = n * L.kn + h * L.kh, ob = n * L.on + h * L.oh;
@@ -108,8 +112,11 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
     }
     __syncthreads(); // Q fragments are in registers; S buffer is free again
 
-    for (int i = tid; i < BQ * D; i += TPB) {
-        Os[i] = 0.f;
+    // O stays in accumulator fragments across key tiles; a rescale goes through the S buffer
+    wmma::fragment<wmma::accumulator, FRAG, FRAG, FRAG, float> acc_o[D / FRAG];
+#pragma unroll
+    for (int dt = 0; dt < D / FRAG; ++dt) {
+        wmma::fill_fragment(acc_o[dt], 0.0f);
     }
     for (int i = tid; i < BQ; i += TPB) {
         ms[i] = -INFINITY;
@@ -124,7 +131,34 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
 
     // prime the software pipeline: tile 0 -> registers -> shared
     __half kreg[KV_PER_THREAD], vreg[KV_PER_THREAD];
+    // 16 bytes a load where the layout allows (the packed one does): K, V and the bias tile, which the softmax then
+    // reads from shared memory instead of 4 bytes per row from global memory
+    const auto aligned = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; };
+    // K and V a 16-byte load per 8 head columns (a head of 8 in a 16-wide tile: one load, the rest zero); the bias
+    // tile wherever its rows are 16-byte aligned, whatever the head
+    const bool vec = DR % 8 == 0 && L.ks % 8 == 0 && kb % 8 == 0 && aligned(k) && aligned(v);
+    const bool vec_b = Sk % 8 == 0 && aligned(bias);
+    constexpr int NKV = (BK * D / 8 + TPB - 1) / TPB, NB = (BQ * BK / 8 + TPB - 1) / TPB;
+    uint4 kvec[NKV], vvec[NKV], bvec[NB];
     auto issue_loads = [&](int k0) {
+        if (vec_b) {
+#pragma unroll
+            for (int t = 0; t < NB; ++t) {
+                const int i = tid + t * TPB, r = i / (BK / 8), c = (i - r * (BK / 8)) * 8, gr = q0 + r, gk = k0 + c;
+                const bool ok = i < BQ * BK / 8 && gr < Sq && gk < Sk;
+                bvec[t] = ok ? *reinterpret_cast<const uint4*>(bias + bh + (long long)gr * Sk + gk) : make_uint4(0, 0, 0, 0);
+            }
+        }
+        if (vec) {
+#pragma unroll
+            for (int t = 0; t < NKV; ++t) {
+                const int i = tid + t * TPB, r = i / (D / 8), c = (i - r * (D / 8)) * 8, gk = k0 + r;
+                const bool ok = i < BK * D / 8 && gk < Sk && c < DR;
+                kvec[t] = ok ? *reinterpret_cast<const uint4*>(k + kb + gk * L.ks + c) : make_uint4(0, 0, 0, 0);
+                vvec[t] = ok ? *reinterpret_cast<const uint4*>(v + kb + gk * L.ks + c) : make_uint4(0, 0, 0, 0);
+            }
+            return;
+        }
 #pragma unroll
         for (int t = 0; t < KV_PER_THREAD; ++t) {
             int i = tid + t * TPB;
@@ -138,12 +172,33 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
         }
     };
     auto commit_loads = [&]() {
+        if (vec_b) {
+#pragma unroll
+            for (int t = 0; t < NB; ++t) {
+                const int i = tid + t * TPB, r = i / (BK / 8), c = (i - r * (BK / 8)) * 8;
+                if (i < BQ * BK / 8) {
+                    *reinterpret_cast<uint4*>(Bs + r * BS_LD + c) = bvec[t];
+                }
+            }
+        }
+        if (vec) {
+#pragma unroll
+            for (int t = 0; t < NKV; ++t) {
+                const int i = tid + t * TPB, r = i / (D / 8), c = (i - r * (D / 8)) * 8;
+                if (i < BK * D / 8) {
+                    *reinterpret_cast<uint4*>(Ks + r * KS_LD + c) = kvec[t];
+                    *reinterpret_cast<uint4*>(Vs + r * KS_LD + c) = vvec[t];
+                }
+            }
+            return;
+        }
 #pragma unroll
         for (int t = 0; t < KV_PER_THREAD; ++t) {
             int i = tid + t * TPB;
             if (i < BK * D) {
-                Ks[i] = kreg[t];
-                Vs[i] = vreg[t];
+                const int r = i / D, c = i - r * D;
+                Ks[r * KS_LD + c] = kreg[t];
+                Vs[r * KS_LD + c] = vreg[t];
             }
         }
     };
@@ -168,7 +223,7 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
 #pragma unroll
             for (int ks = 0; ks < D / FRAG; ++ks) {
                 wmma::fragment<wmma::matrix_b, FRAG, FRAG, FRAG, __half, wmma::col_major> fb;
-                wmma::load_matrix_sync(fb, Ks + (nt * FRAG) * D + ks * FRAG, D);
+                wmma::load_matrix_sync(fb, Ks + (nt * FRAG) * KS_LD + ks * FRAG, KS_LD);
                 wmma::mma_sync(acc, fq[ks], fb, acc);
             }
             wmma::store_matrix_sync(Ss + (warp * FRAG) * SS_LD + nt * FRAG, acc, SS_LD,
@@ -177,7 +232,8 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
         __syncwarp();
 
         // online softmax (scalar; Volta's fragment layout is opaque)
-        float m_prev = ms[r_blk], m_cur = m_prev;
+        const float m_prev = ms[r_blk];
+        float m_tile = -INFINITY;
         const bool row_ok = (gq < Sq);
         for (int c = half_id; c < BK; c += 2) {
             const int gk = k0 + c;
@@ -186,13 +242,17 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
                 // keys past Sk get no weight, so a fully masked row averages Sk keys
                 s = (gk >= Sk && row_ok) ? -INFINITY : MASKED_LOGIT * LOG2E;
             } else {
-                s = Ss[r_blk * SS_LD + c] * qk_scale +
-                    __half2float(bias[bh + (long long)gq * Sk + gk]) * LOG2E;
+                const __half b = vec_b ? Bs[r_blk * BS_LD + c] : bias[bh + (long long)gq * Sk + gk];
+                s = Ss[r_blk * SS_LD + c] * qk_scale + __half2float(b) * LOG2E;
             }
             Ss[r_blk * SS_LD + c] = s;
-            m_cur = fmaxf(m_cur, s);
+            m_tile = fmaxf(m_tile, s);
         }
-        m_cur = fmaxf(m_cur, __shfl_xor_sync(0xffffffffu, m_cur, 1));
+        m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffffu, m_tile, 1));
+        // the row's max moves only when a tile raises it past 2^6 (FlashMLA's rule): otherwise O and l keep their
+        // scale and this tile's exp2 stays below 2^6, well inside fp16 P and the fp32 sums
+        const bool raise = m_tile > m_prev + 6.f;
+        const float m_cur = raise ? fmaxf(m_prev, m_tile) : m_prev;
 
         float l_part = 0.f;
         for (int c = half_id; c < BK; c += 2) {
@@ -201,33 +261,40 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
             l_part += p;
         }
         l_part += __shfl_xor_sync(0xffffffffu, l_part, 1);
-        const float alpha = ex2_ftz(m_prev - m_cur);
+        const float alpha = raise ? ex2_ftz(m_prev - m_cur) : 1.f;
         if (half_id == 0) {
             ms[r_blk] = m_cur;
             ls[r_blk] = ls[r_blk] * alpha + l_part;
         }
         __syncwarp();
 
-// O = O*alpha + P @ V
+// O = O*alpha + P @ V. A fragment's rows are opaque, so a per-row rescale goes through shared memory: only when a row
+        // of this warp raised its max, and never on the first tile (O is still zero)
+        if (k0 > 0 && __any_sync(0xffffffffu, raise)) {
+#pragma unroll
+            for (int dt = 0; dt < D / FRAG; ++dt) {
+                wmma::store_matrix_sync(Ss + (warp * FRAG) * SS_LD + dt * FRAG, acc_o[dt], SS_LD, wmma::mem_row_major);
+            }
+            __syncwarp();
+            for (int c = half_id; c < D; c += 2) {
+                Ss[r_blk * SS_LD + c] *= alpha;
+            }
+            __syncwarp();
+#pragma unroll
+            for (int dt = 0; dt < D / FRAG; ++dt) {
+                wmma::load_matrix_sync(acc_o[dt], Ss + (warp * FRAG) * SS_LD + dt * FRAG, SS_LD, wmma::mem_row_major);
+            }
+        }
 #pragma unroll
         for (int dt = 0; dt < D / FRAG; ++dt) {
-            wmma::fragment<wmma::accumulator, FRAG, FRAG, FRAG, float> acc;
-            wmma::fill_fragment(acc, 0.0f);
 #pragma unroll
             for (int ks = 0; ks < BK / FRAG; ++ks) {
                 wmma::fragment<wmma::matrix_a, FRAG, FRAG, FRAG, __half, wmma::row_major> fa;
                 wmma::fragment<wmma::matrix_b, FRAG, FRAG, FRAG, __half, wmma::row_major> fb;
                 wmma::load_matrix_sync(fa, Ps + (warp * FRAG) * PS_LD + ks * FRAG, PS_LD);
-                wmma::load_matrix_sync(fb, Vs + (ks * FRAG) * D + dt * FRAG, D);
-                wmma::mma_sync(acc, fa, fb, acc);
+                wmma::load_matrix_sync(fb, Vs + (ks * FRAG) * KS_LD + dt * FRAG, KS_LD);
+                wmma::mma_sync(acc_o[dt], fa, fb, acc_o[dt]);
             }
-            wmma::store_matrix_sync(Ss + (warp * FRAG) * SS_LD + dt * FRAG, acc, SS_LD,
-                                    wmma::mem_row_major);
-        }
-        __syncwarp();
-        for (int c = half_id; c < D; c += 2) {
-            const int dt = c / FRAG, off = c % FRAG;
-            Os[r_blk * D + c] = Os[r_blk * D + c] * alpha + Ss[r_blk * SS_LD + dt * FRAG + off];
         }
 
         // rotate the pipeline
@@ -238,6 +305,12 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
         }
     }
 
+    // O's rows, for the normalisation and the gate
+#pragma unroll
+    for (int dt = 0; dt < D / FRAG; ++dt) {
+        wmma::store_matrix_sync(Ss + (warp * FRAG) * SS_LD + dt * FRAG, acc_o[dt], SS_LD, wmma::mem_row_major);
+    }
+    __syncwarp();
     if (gq < Sq) {
         // softmax statistic, for the backward pass. Both lanes of a row hold
         // the same reduced m/l, so only one of them writes.
@@ -251,7 +324,7 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
         const float inv = 1.0f / fmaxf(ls[r_blk], 1e-30f);
         for (int c = half_id; c < DR; c += 2) {
             out[ob + gq * L.os + c] =
-                __float2half(L.apply_gate(Os[r_blk * D + c] * inv, qb + gq * L.qs + c, h, c, DR));
+                __float2half(L.apply_gate(Ss[r_blk * SS_LD + c] * inv, qb + gq * L.qs + c, h, c, DR));
         }
     }
 }
@@ -263,8 +336,8 @@ static ffi::Error launch(cudaStream_t stream, int device, const __half* q, const
                          const AttnLayout& L) {
     constexpr int SS_LD = (BK > D ? BK : D) + 4, PS_LD = BK + 8;
     constexpr size_t smem = (size_t)(BQ * SS_LD) * sizeof(float) +
-                            (size_t)(BQ * PS_LD + 2 * BK * D) * sizeof(__half) +
-                            (size_t)(BQ * D + 2 * BQ) * sizeof(float);
+                            (size_t)(BQ * PS_LD + 2 * BK * (D + 8) + BQ * (BK + 8)) * sizeof(__half) +
+                            (size_t)(2 * BQ) * sizeof(float);
     auto kern = volta_wmma_kernel<D, BQ, BK, WANT_LSE>;
     const int max_smem = device_shared_limit(device);
     if ((int)smem > max_smem) {
