@@ -59,6 +59,7 @@ struct LnGdpArgs {
 struct EpilogueArgs {
     const float* x_cm;                     // [C, M] triangle product, channel major
     const __half *x, *woT, *bo, *wgT, *bg; // x [M,CA] raw module input, woT [O,C], wgT [O,CA]
+    const __half* keep;                    // [M] or null, see tile_work
     const float *in_scale, *in_offset;     // [CA]
     const float *ln_scale, *ln_offset;     // [C]
     __half* out;                           // [M, O]
@@ -69,6 +70,7 @@ struct EpilogueArgs {
 struct ProjArgs {
     const __half *x, *wT, *b, *residual,
         *wbT;                    // x [M,K], wT [N,K], b [N], residual [M,N], wbT [h,K]
+    const __half* keep;          // [M] or null, see tile_work
     const float *scale, *offset; // [K]
     __half *out, *bias;          // out [M,N], bias [h,M]
     int M, N, heads;
@@ -78,11 +80,60 @@ struct ProjArgs {
 struct TransitionArgs {
     const __half *x, *w1T, *b1, *w2T,
         *b2;                     // x [M,C], w1T [H,C], b1 [H], w2T [H/kHidden][C][kHidden]
+    const __half* keep;          // [M] or null, see tile_work
     const float *scale, *offset; // [C]
     __half* out;                 // [M, C]
     int M, H;
     float eps;
 };
+
+// What a row tile does, as the Pallas kernels' unless_padding: compute it when a row of keep is above
+// zero, write what padding gives (zeros, or nothing where the output aliases the residual) when its
+// rows are all zero, nothing at all when they are all below zero (outside what any consumer reads).
+enum TileWork { kCompute, kPadding, kSkip };
+
+// Every thread of the block must call it. Rows past M read as other; null keep computes every tile.
+template <int R>
+__device__ __forceinline__ TileWork tile_work(const __half* __restrict__ keep, int M, int m0,
+                                              float other) {
+    if (keep == nullptr) {
+        return kCompute;
+    }
+    bool live = false, zero = false;
+    for (int r = threadIdx.x; r < R; r += kThreads) {
+        const float k = m0 + r < M ? __half2float(keep[m0 + r]) : other;
+        live |= k > 0.f;
+        zero |= k == 0.f;
+    }
+    if (__syncthreads_or(live)) {
+        return kCompute;
+    }
+    return __syncthreads_or(zero) ? kPadding : kSkip;
+}
+
+// Zeros in rows [m0, m0+R) of a row-major [M][N] matrix, N a multiple of 8.
+template <int R>
+__device__ __forceinline__ void zero_rows(__half* __restrict__ out, int N, int M, int m0) {
+    const int V = N / 8;
+    for (int i = threadIdx.x; i < R * V; i += kThreads) {
+        const int r = i / V;
+        if (m0 + r < M) {
+            reinterpret_cast<uint4*>(out + (long long)(m0 + r) * N)[i - r * V] =
+                make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
+}
+
+// Zeros in columns [m0, m0+R) of a channel-major [C][M] matrix.
+template <int R>
+__device__ __forceinline__ void zero_columns(__half* __restrict__ out, int C, int M, int m0) {
+    for (int i = threadIdx.x; i < R * C; i += kThreads) {
+        const int c = i / R, r = i - c * R;
+        if (m0 + r < M) {
+            out[(long long)c * M + m0 + r] = __float2half(0.f);
+        }
+    }
+}
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll

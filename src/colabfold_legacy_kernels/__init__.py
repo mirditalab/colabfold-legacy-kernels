@@ -34,7 +34,7 @@ _TABLE = {
         (75, "libvolta_ops.so", "VoltaGdp"),
         (70, "libvolta_gdp_wmma.so", "VoltaGdpWmma"),
     ),
-    # LayerNorm fused into the tri-mul and attention projections, at widths 64 and 128
+    # LayerNorm fused into the tri-mul and attention projections and the transition
     "ln_gated_dual_proj": (
         (75, "libvolta_ops.so", "VoltaLnGdp"),
         (70, "libvolta_gdp_wmma.so", "VoltaLnGdpWmma"),

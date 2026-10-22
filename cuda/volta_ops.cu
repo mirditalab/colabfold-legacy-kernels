@@ -336,6 +336,15 @@ template <int K> __global__ __launch_bounds__(kThreads) void ln_gdp_kernel(LnGdp
     __half* Ws = Xs + BM * XS_LD;                 // [kTileN][kWsLd] weight tile
     __half* Ts = Ws;                              // [kTileN][TS_LD] output tile, once Ws is done
 
+    // the mask is the keep: below zero outside what the contraction reads, inside a computed tile 0
+    const TileWork work = tile_work<BM>(a.mask, a.M, m0, 0.f);
+    if (work != kCompute) {
+        if (work == kPadding) {
+            zero_columns<BM>(a.left, a.P / 2, a.M, m0);
+            zero_columns<BM>(a.right, a.P / 2, a.M, m0);
+        }
+        return;
+    }
     load_rows<BM, K, XS_LD>(Xs, a.x, K, m0, 0, a.M);
     __syncthreads();
     ln_rows<BM, K, XS_LD>(Xs, a.scale, a.offset, a.eps);
@@ -351,7 +360,7 @@ template <int K> __global__ __launch_bounds__(kThreads) void ln_gdp_kernel(LnGdp
 #pragma unroll
         for (int hi = 0; hi < 2; ++hi) {
             const int r = warp * 16 + lr + hi * 8;
-            const float mv = m0 + r < a.M ? __half2float(a.mask[m0 + r]) : 0.f;
+            const float mv = m0 + r < a.M ? fmaxf(__half2float(a.mask[m0 + r]), 0.f) : 0.f;
 #pragma unroll
             for (int nt = 0; nt < NN; ++nt) {
 #pragma unroll
@@ -401,6 +410,13 @@ __global__ __launch_bounds__(kThreads) void epilogue_kernel(EpilogueArgs a) {
     __half* Ws = As + BM * AS_LD;                 // [kTileN][kWsLd]
     float* red = reinterpret_cast<float*>(Ws + kTileN * kWsLd);
 
+    const TileWork work = tile_work<BM>(a.keep, a.M, m0, -1.f);
+    if (work != kCompute) {
+        if (work == kPadding && !ADD) { // with add_input the output aliases x, which it keeps
+            zero_rows<BM>(a.out, a.O, a.M, m0);
+        }
+        return;
+    }
     load_rows<BM, CA, AS_LD>(As, a.x, CA, m0, 0, a.M);
     ln_columns<BM, C, YS_LD>(Ys, red, a.x_cm, a.M, m0, a.ln_scale, a.ln_offset, a.eps);
     ln_rows<BM, CA, AS_LD>(As, a.in_scale, a.in_offset, a.eps);
@@ -463,6 +479,18 @@ template <int K, bool LN> __global__ __launch_bounds__(kThreads) void proj_kerne
     __half* Ws = Xs + BM * XS_LD;                 // [kTileN][kWsLd]
     __half* Hb = Ws + kTileN * kWsLd;             // [kMaxHeads][BM]
 
+    const TileWork work = tile_work<BM>(a.keep, a.M, m0, -1.f);
+    if (work != kCompute) {
+        if (work == kPadding) { // with a residual the output aliases it, which it keeps
+            if (a.N && !a.residual) {
+                zero_rows<BM>(a.out, a.N, a.M, m0);
+            }
+            if (a.heads) {
+                zero_columns<BM>(a.bias, a.heads, a.M, m0);
+            }
+        }
+        return;
+    }
     load_rows<BM, K, XS_LD>(Xs, a.x, K, m0, 0, a.M);
     __syncthreads();
     if constexpr (LN) {
@@ -509,17 +537,28 @@ template <int K, bool LN> void launch_proj(cudaStream_t stream, const ProjArgs& 
     proj_kernel<K, LN><<<grid, kThreads, proj_smem<K>(), stream>>>(a);
 }
 
-template <int C> constexpr size_t transition_smem() {
-    return (kRows * (C + 8) + kRows * (kHidden + 8) + kTileN * kWsLd) * sizeof(__half);
+// Rows per block: 64 with a warp per 16 rows, 32 with a 2x2 warp grid at 256 channels, where a
+// 64-row fp32 output would not fit the registers.
+template <int C> __host__ __device__ constexpr int transition_rows() {
+    return C > 128 ? kEpiRows : kRows;
 }
 
-// A block owns 64 rows of LN(x) and the fp32 [64, C] output: each kHidden-wide chunk of the
-// hidden activation goes through shared memory, a warp writing and reading only its own 16 rows.
+template <int C> constexpr size_t transition_smem() {
+    constexpr int BM = transition_rows<C>();
+    return (BM * (C + 8) + BM * (kHidden + 8) + kTileN * kWsLd) * sizeof(__half);
+}
+
+// A block owns BM rows of LN(x) and the fp32 [BM, C] output: each kHidden-wide chunk of the hidden
+// activation goes through shared memory, WN warps side by side on each 16 rows.
 template <int C, bool ADD>
 __global__ __launch_bounds__(kThreads) void transition_kernel(TransitionArgs a) {
-    constexpr int BM = kRows, NC = C / 8, NH = kHidden / 8, XS_LD = C + 8, HS_LD = kHidden + 8;
+    constexpr int BM = transition_rows<C>(), WM = BM / 16, WN = kThreads / WARP / WM;
+    constexpr int NH = kHidden / WN / 8, NO = kTileN / WN / 8, NC = C / kTileN * NO;
+    constexpr int XS_LD = C + 8, HS_LD = kHidden + 8;
     const int lane = threadIdx.x & (WARP - 1), warp = threadIdx.x / WARP;
     const int lr = lane >> 2, lc = (lane & 3) * 2;
+    // one warp column at 64 rows: wn a constant there, not an index the registers carry
+    const int wm = WN == 1 ? warp : warp % WM, wn = WN == 1 ? 0 : warp / WM;
     const int m0 = blockIdx.x * BM;
 
     extern __shared__ __align__(16) char smem[];
@@ -527,6 +566,13 @@ __global__ __launch_bounds__(kThreads) void transition_kernel(TransitionArgs a) 
     __half* Hs = Xs + BM * XS_LD;                 // [BM][HS_LD] one hidden chunk
     __half* Ws = Hs + BM * HS_LD;                 // [kTileN][kWsLd]
 
+    const TileWork work = tile_work<BM>(a.keep, a.M, m0, -1.f);
+    if (work != kCompute) {
+        if (work == kPadding && !ADD) { // with add_input the output aliases x, which it keeps
+            zero_rows<BM>(a.out, C, a.M, m0);
+        }
+        return;
+    }
     load_rows<BM, C, XS_LD>(Xs, a.x, C, m0, 0, a.M);
     __syncthreads();
     ln_rows<BM, C, XS_LD>(Xs, a.scale, a.offset, a.eps);
@@ -536,13 +582,14 @@ __global__ __launch_bounds__(kThreads) void transition_kernel(TransitionArgs a) 
     for (int h0 = 0; h0 < a.H; h0 += kHidden) {
         FragC hid[NH];
         clear<NH>(hid);
-        tile_gemm<C, NH>(hid, Xs, XS_LD, Ws, a.w1T, h0, warp * 16, 0);
+        // its first barrier also orders this chunk's Hs writes after the last chunk's reads
+        tile_gemm<C, NH>(hid, Xs, XS_LD, Ws, a.w1T, h0, wm * 16, wn * NH * 8);
 #pragma unroll
         for (int hi = 0; hi < 2; ++hi) {
-            const int r = warp * 16 + lr + hi * 8;
+            const int r = wm * 16 + lr + hi * 8;
 #pragma unroll
             for (int nt = 0; nt < NH; ++nt) {
-                const int n = nt * 8 + lc;
+                const int n = wn * NH * 8 + nt * 8 + lc;
                 *reinterpret_cast<__half2*>(Hs + r * HS_LD + n) = __floats2half2_rn(
                     fmaxf(hid[nt][hi * 2] + __half2float(a.b1[h0 + n]), 0.f),
                     fmaxf(hid[nt][hi * 2 + 1] + __half2float(a.b1[h0 + n + 1]), 0.f));
@@ -551,21 +598,22 @@ __global__ __launch_bounds__(kThreads) void transition_kernel(TransitionArgs a) 
         const __half* w2 = a.w2T + (long long)(h0 / kHidden) * C * kHidden;
 #pragma unroll
         for (int o0 = 0; o0 < C; o0 += kTileN) {
-            tile_gemm<kHidden, kTileN / 8>(acc + o0 / 8, Hs, HS_LD, Ws, w2, o0, warp * 16, 0);
+            tile_gemm<kHidden, NO>(acc + o0 / kTileN * NO, Hs, HS_LD, Ws, w2, o0, wm * 16,
+                                   wn * NO * 8);
         }
     }
 
 #pragma unroll
     for (int hi = 0; hi < 2; ++hi) {
-        const int gm = m0 + warp * 16 + lr + hi * 8;
+        const int gm = m0 + wm * 16 + lr + hi * 8;
         if (gm >= a.M) {
             continue;
         }
 #pragma unroll
-        for (int nt = 0; nt < NC; ++nt) {
-            const int n = nt * 8 + lc;
-            float v0 = acc[nt][hi * 2] + __half2float(a.b2[n]);
-            float v1 = acc[nt][hi * 2 + 1] + __half2float(a.b2[n + 1]);
+        for (int t = 0; t < NC; ++t) {
+            const int n = t / NO * kTileN + wn * NO * 8 + t % NO * 8 + lc;
+            float v0 = acc[t][hi * 2] + __half2float(a.b2[n]);
+            float v1 = acc[t][hi * 2 + 1] + __half2float(a.b2[n + 1]);
             if constexpr (ADD) {
                 const float2 x =
                     __half22float2(*reinterpret_cast<const __half2*>(a.x + (long long)gm * C + n));
@@ -578,7 +626,8 @@ __global__ __launch_bounds__(kThreads) void transition_kernel(TransitionArgs a) 
 }
 
 template <int C, bool ADD> void launch_transition(cudaStream_t stream, const TransitionArgs& a) {
-    const dim3 grid((a.M + kRows - 1) / kRows);
+    constexpr int BM = transition_rows<C>();
+    const dim3 grid((a.M + BM - 1) / BM);
     transition_kernel<C, ADD><<<grid, kThreads, transition_smem<C>(), stream>>>(a);
 }
 

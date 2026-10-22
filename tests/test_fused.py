@@ -5,7 +5,7 @@
 CC picks the family: 75 takes the mma kernels (libvolta_ops.so), 70 the wmma ones
 (libvolta_gdp_wmma.so). Covers ln_gated_dual_proj, trimul_epilogue_ln, ln_projection,
 output_projection, transition and the channel-major gated_dual_proj, at row counts 1, 59,
-4101 and a 260 x 260 pair, widths 128 and 64.
+4101 and a 260 x 260 pair, widths 128 and 64, and the MSA's 256 for the transition. Skipping padded row blocks (keep) is in colabfold-kernels' test_padding_skip.py.
 """
 import os
 import sys
@@ -213,7 +213,7 @@ for k, c in ((128, 128), (64, 64), (128, 64), (64, 128)):
       grad_check(f"output_projection k={k} c={c} m={m}", op, pa.ref_output_projection, [o, w, b, r], [0, 1, 3])
 
 # ---- transition: the pair stack's factor 4, the template stack's 2 ---------------
-for c, factor in ((128, 4), (64, 2), (64, 4)):
+for c, factor in ((128, 4), (64, 2), (64, 4), (256, 4)):
   t = fused_ops.transition(gc, dt, c, factor * c)
   if t is None:
     report(f"transition c={c} x{factor}: no kernel selected", float("inf"))
@@ -232,10 +232,11 @@ for c, factor in ((128, 4), (64, 2), (64, 4)):
       grad_check(f"transition c={c} x{factor} m={m}", lambda *z: t(*z, add_input=True),
                  lambda *z: tr.ref_transition(*z, add_input=True), args, [0, 1, 3, 5])
 
-# widths outside 64 and 128 decline to the caller's own path
+# other widths decline to the caller's own path
 declined = (fused_ops.ln_gated_dual_proj(gc, dt, 256, 128), fused_ops.ln_projection(gc, dt, 128, 32),
-            fused_ops.output_projection(gc, dt, 256, 256), fused_ops.ln_projection(gc, jnp.bfloat16, 128, 128),
-            fused_ops.transition(gc, dt, 256, 1024), fused_ops.transition(gc, dt, 128, 384))
+            fused_ops.output_projection(gc, dt, 256, 256), fused_ops.ln_projection(gc, dt, 256, 256),
+            fused_ops.ln_projection(gc, jnp.bfloat16, 128, 128),
+            fused_ops.transition(gc, dt, 512, 2048), fused_ops.transition(gc, dt, 128, 384))
 report("other widths and dtypes decline", 0. if all(d is None for d in declined) else 1.)
 
 print("RESULT:", "PASS" if not bad else f"FAIL ({bad})")

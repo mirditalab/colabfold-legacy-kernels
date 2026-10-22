@@ -237,6 +237,15 @@ template <int K> __global__ __launch_bounds__(kThreads) void ln_gdp_kernel(LnGdp
     __half* Ts = Ws;                                               // [kTileN][TS_LD] after Ws
     float* ep = reinterpret_cast<float*>(smem + ln_gdp_xs<K>() + ln_gdp_ws()) + warp * kScratch;
 
+    // the mask is the keep: below zero outside what the contraction reads, inside a computed tile 0
+    const TileWork work = tile_work<BM>(a.mask, a.M, m0, 0.f);
+    if (work != kCompute) {
+        if (work == kPadding) {
+            zero_columns<BM>(a.left, a.P / 2, a.M, m0);
+            zero_columns<BM>(a.right, a.P / 2, a.M, m0);
+        }
+        return;
+    }
     load_rows<BM, K, XS_LD>(Xs, a.x, K, m0, 0, a.M);
     __syncthreads();
     ln_rows<BM, K, XS_LD>(Xs, a.scale, a.offset, a.eps);
@@ -258,7 +267,7 @@ template <int K> __global__ __launch_bounds__(kThreads) void ln_gdp_kernel(LnGdp
 #pragma unroll
             for (int t = 0; t < kScratch / WARP; ++t) {
                 const int i = lane + t * WARP, r = warp * FRAG + i % FRAG, n = f * FRAG + i / FRAG;
-                const float mv = m0 + r < a.M ? __half2float(a.mask[m0 + r]) : 0.f;
+                const float mv = m0 + r < a.M ? fmaxf(__half2float(a.mask[m0 + r]), 0.f) : 0.f;
                 const float pv = p[t] + __half2float(a.bp[n0 + n]);
                 const float gv = g[t] + __half2float(a.bg[n0 + n]);
                 Ts[n * TS_LD + r] = __float2half(mv * pv * gdp_act<GdpAct::kSigmoid>(gv));
@@ -314,6 +323,13 @@ __global__ __launch_bounds__(kThreads) void epilogue_kernel(EpilogueArgs a) {
     float* ep = reinterpret_cast<float*>(p) + warp * kScratch;
     float* red = reinterpret_cast<float*>(p + epi_ep());
 
+    const TileWork work = tile_work<BM>(a.keep, a.M, m0, -1.f);
+    if (work != kCompute) {
+        if (work == kPadding && !ADD) { // with add_input the output aliases x, which it keeps
+            zero_rows<BM>(a.out, a.O, a.M, m0);
+        }
+        return;
+    }
     load_rows<BM, CA, AS_LD>(As, a.x, CA, m0, 0, a.M);
     ln_columns<BM, C, YS_LD>(Ys, red, a.x_cm, a.M, m0, a.ln_scale, a.ln_offset, a.eps);
     ln_rows<BM, CA, AS_LD>(As, a.in_scale, a.in_offset, a.eps);
@@ -376,6 +392,18 @@ template <int K, bool LN> __global__ __launch_bounds__(kThreads) void proj_kerne
     float* ep = scratch + warp * kScratch;
     __half* Hb = reinterpret_cast<__half*>(scratch + kThreads / WARP * kScratch); // [kMaxHeads][BM]
 
+    const TileWork work = tile_work<BM>(a.keep, a.M, m0, -1.f);
+    if (work != kCompute) {
+        if (work == kPadding) { // with a residual the output aliases it, which it keeps
+            if (a.N && !a.residual) {
+                zero_rows<BM>(a.out, a.N, a.M, m0);
+            }
+            if (a.heads) {
+                zero_columns<BM>(a.bias, a.heads, a.M, m0);
+            }
+        }
+        return;
+    }
     load_rows<BM, K, XS_LD>(Xs, a.x, K, m0, 0, a.M);
     __syncthreads();
     if constexpr (LN) {
@@ -419,32 +447,46 @@ template <int K, bool LN> void launch_proj(cudaStream_t stream, const ProjArgs& 
     proj_kernel<K, LN><<<grid, kThreads, proj_smem<K>(), stream>>>(a);
 }
 
-template <int C> __host__ __device__ constexpr size_t tr_xs() {
-    return align32(kRows * (C + 8) * sizeof(__half));
+// See volta_ops.cu: 64 rows a block, 32 with a 2x2 warp grid at 256 channels.
+template <int C> __host__ __device__ constexpr int transition_rows() {
+    return C > 128 ? kEpiRows : kRows;
 }
-__host__ __device__ constexpr size_t tr_hs() {
-    return align32(kRows * (kHidden + 8) * sizeof(__half));
+template <int C> __host__ __device__ constexpr size_t tr_xs() {
+    return align32(transition_rows<C>() * (C + 8) * sizeof(__half));
+}
+template <int C> __host__ __device__ constexpr size_t tr_hs() {
+    return align32(transition_rows<C>() * (kHidden + 8) * sizeof(__half));
 }
 template <int C> __host__ __device__ constexpr size_t transition_smem() {
-    return tr_xs<C>() + tr_hs() + ws_bytes() + kThreads / WARP * kScratch * sizeof(float);
+    return tr_xs<C>() + tr_hs<C>() + ws_bytes() + kThreads / WARP * kScratch * sizeof(float);
 }
 
-// See volta_ops.cu: 64 rows of LN(x) and the fp32 output per block, the hidden activation
-// through shared memory one kHidden chunk at a time, a warp touching only its own 16 rows.
+// See volta_ops.cu: BM rows of LN(x) and the fp32 output per block, the hidden activation through
+// shared memory one kHidden chunk at a time, WN warps side by side on each 16 rows.
 template <int C, bool ADD>
 __global__ __launch_bounds__(kThreads) void transition_kernel(TransitionArgs a) {
-    constexpr int BM = kRows, NC = C / FRAG, NH = kHidden / FRAG, XS_LD = C + 8;
-    constexpr int HS_LD = kHidden + 8;
+    constexpr int BM = transition_rows<C>(), WM = BM / FRAG, WN = kThreads / WARP / WM;
+    constexpr int NH = kHidden / WN / FRAG, NO = kTileN / WN / FRAG, NC = C / kTileN * NO;
+    constexpr int XS_LD = C + 8, HS_LD = kHidden + 8;
     const int lane = threadIdx.x & (WARP - 1), warp = threadIdx.x / WARP;
+    // one warp column at 64 rows: wn a constant there, not an index the registers carry
+    const int wm = WN == 1 ? warp : warp % WM, wn = WN == 1 ? 0 : warp / WM;
     const int m0 = blockIdx.x * BM;
 
     extern __shared__ __align__(128) char smem[];
-    __half* Xs = reinterpret_cast<__half*>(smem);                        // [BM][XS_LD] LN(x)
-    __half* Hs = reinterpret_cast<__half*>(smem + tr_xs<C>());           // [BM][HS_LD]
-    __half* Ws = reinterpret_cast<__half*>(smem + tr_xs<C>() + tr_hs()); // [kTileN][kWsLd]
-    float* ep =
-        reinterpret_cast<float*>(smem + tr_xs<C>() + tr_hs() + ws_bytes()) + warp * kScratch;
+    __half* Xs = reinterpret_cast<__half*>(smem);                            // [BM][XS_LD] LN(x)
+    __half* Hs = reinterpret_cast<__half*>(smem + tr_xs<C>());               // [BM][HS_LD]
+    __half* Ws = reinterpret_cast<__half*>(smem + tr_xs<C>() + tr_hs<C>()); // [kTileN][kWsLd]
+    float* ep = reinterpret_cast<float*>(smem + tr_xs<C>() + tr_hs<C>() + ws_bytes()) +
+                warp * kScratch;
 
+    const TileWork work = tile_work<BM>(a.keep, a.M, m0, -1.f);
+    if (work != kCompute) {
+        if (work == kPadding && !ADD) { // with add_input the output aliases x, which it keeps
+            zero_rows<BM>(a.out, C, a.M, m0);
+        }
+        return;
+    }
     load_rows<BM, C, XS_LD>(Xs, a.x, C, m0, 0, a.M);
     __syncthreads();
     ln_rows<BM, C, XS_LD>(Xs, a.scale, a.offset, a.eps);
@@ -454,23 +496,24 @@ __global__ __launch_bounds__(kThreads) void transition_kernel(TransitionArgs a) 
     for (int h0 = 0; h0 < a.H; h0 += kHidden) {
         Acc hid[NH];
         clear<NH>(hid);
-        tile_gemm<C, NH>(hid, Xs, XS_LD, Ws, a.w1T, h0, warp * FRAG, 0);
+        // its first barrier also orders this chunk's Hs writes after the last chunk's reads
+        tile_gemm<C, NH>(hid, Xs, XS_LD, Ws, a.w1T, h0, wm * FRAG, wn * NH * FRAG);
 #pragma unroll
         for (int f = 0; f < NH; ++f) {
             float v[kScratch / WARP];
             read_back(v, ep, hid[f], wmma::mem_row_major);
 #pragma unroll
             for (int t = 0; t < kScratch / WARP; ++t) {
-                const int i = lane + t * WARP, n = f * FRAG + i % FRAG;
-                Hs[(warp * FRAG + i / FRAG) * HS_LD + n] =
+                const int i = lane + t * WARP, n = (wn * NH + f) * FRAG + i % FRAG;
+                Hs[(wm * FRAG + i / FRAG) * HS_LD + n] =
                     __float2half(fmaxf(v[t] + __half2float(a.b1[h0 + n]), 0.f));
             }
         }
         const __half* w2 = a.w2T + (long long)(h0 / kHidden) * C * kHidden;
 #pragma unroll
         for (int o0 = 0; o0 < C; o0 += kTileN) {
-            tile_gemm<kHidden, kTileN / FRAG>(acc + o0 / FRAG, Hs, HS_LD, Ws, w2, o0, warp * FRAG,
-                                              0);
+            tile_gemm<kHidden, NO>(acc + o0 / kTileN * NO, Hs, HS_LD, Ws, w2, o0, wm * FRAG,
+                                   wn * NO * FRAG);
         }
     }
 
@@ -481,7 +524,8 @@ __global__ __launch_bounds__(kThreads) void transition_kernel(TransitionArgs a) 
 #pragma unroll
         for (int t = 0; t < kScratch / WARP; ++t) {
             const int i = lane + t * WARP;
-            const int gm = m0 + warp * FRAG + i / FRAG, n = f * FRAG + i % FRAG;
+            const int gm = m0 + wm * FRAG + i / FRAG;
+            const int n = f / NO * kTileN + (wn * NO + f % NO) * FRAG + i % FRAG;
             if (gm >= a.M) {
                 continue;
             }
@@ -495,7 +539,8 @@ __global__ __launch_bounds__(kThreads) void transition_kernel(TransitionArgs a) 
 }
 
 template <int C, bool ADD> void launch_transition(cudaStream_t stream, const TransitionArgs& a) {
-    const dim3 grid((a.M + kRows - 1) / kRows);
+    constexpr int BM = transition_rows<C>();
+    const dim3 grid((a.M + BM - 1) / BM);
     transition_kernel<C, ADD><<<grid, kThreads, transition_smem<C>(), stream>>>(a);
 }
 
