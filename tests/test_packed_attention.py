@@ -5,7 +5,8 @@
 Rows and columns, heads 8 to 64, lengths that are and are not a multiple of 8 (on sm_70 they take the m8n8k4 kernel or
 the wmma one), masked keys. Each shape runs in a fresh process with one allocation per array
 (XLA_PYTHON_CLIENT_ALLOCATOR=platform), where a read past an array faults. Trim: live rows and keys as the reference,
-the padded queries of a live row as without trim or zero, a row with no live key zero.
+the padded queries of a live row and a row with no live key zero, with p and the bias NaN past the live length rounded
+to 64 (what the projection leaves unwritten there).
 """
 import ctypes
 import os
@@ -76,10 +77,13 @@ def one(family, X, Y, H, D, column, frac, live):
   err = np.abs(o - r)[rows].max() if rows.any() else 0.0
   if live >= S:
     return err < 0.03, f'max err {err:.2e}'
-  t = to_bs(call(sym, p, bias, jnp.asarray(km), gb, column, trim_limits(km)))
+  seq = np.arange(S) >= -(-live // 64) * 64
+  pp, pb = np.asarray(p).copy(), np.asarray(bias).copy()
+  pp[(seq, slice(None)) if column else (slice(None), seq)] = np.nan
+  pb[:, seq], pb[:, :, seq] = np.nan, np.nan
+  t = to_bs(call(sym, jnp.asarray(pp), jnp.asarray(pb), jnp.asarray(km), gb, column, trim_limits(km)))
   e_live = np.abs(t[rows][:, :live] - r[rows][:, :live]).max()
-  pad = t[rows][:, live:]
-  e_pad = np.minimum(np.abs(pad - o[rows][:, live:]), np.abs(pad)).max()
+  e_pad = np.abs(t[rows][:, live:]).max()
   e_dead = np.abs(t[~rows]).max()
   return (err < 0.03 and e_live < 0.03 and e_pad == 0 and e_dead == 0,
           f'max err {err:.2e}, trim live {e_live:.2e} padded {e_pad:.2e} dead {e_dead:.2e}')

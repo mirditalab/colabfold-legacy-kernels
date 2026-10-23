@@ -323,9 +323,11 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
             }
         }
         const float inv = 1.0f / fmaxf(ls[r_blk], 1e-30f);
+        // past the query limit: padding, zeros whatever its unwritten q, gate or bias rows hold
+        const bool pad = L.lims != nullptr && gq >= L.lims[N];
         for (int c = half_id; c < DR; c += 2) {
-            out[ob + gq * L.os + c] =
-                __float2half(L.apply_gate(Ss[r_blk * SS_LD + c] * inv, qb + gq * L.qs + c, h, c, DR));
+            out[ob + gq * L.os + c] = __float2half(
+                pad ? 0.f : L.apply_gate(Ss[r_blk * SS_LD + c] * inv, qb + gq * L.qs + c, h, c, DR));
         }
     }
 }
@@ -647,6 +649,8 @@ __global__ __launch_bounds__(BQ / 32 * WARP) void volta_mma884_packed_kernel(
             continue;
         }
         const float inv = 1.0f / fmaxf(l_run[sl], 1e-30f);
+        // past the query limit: padding, zeros whatever its unwritten q, gate or bias rows hold
+        const bool pad = L.lims != nullptr && gq >= L.lims[N];
 #pragma unroll
         for (int d = 0; d < ND; ++d)
 #pragma unroll
@@ -654,7 +658,7 @@ __global__ __launch_bounds__(BQ / 32 * WARP) void volta_mma884_packed_kernel(
 #pragma unroll
                 for (int j = 0; j < 2; ++j) {
                     const int col = d * 8 + hh * 4 + cx + j;
-                    out[ob + gq * L.os + col] = __float2half(
+                    out[ob + gq * L.os + col] = __float2half(pad ? 0.f :
                         L.apply_gate(o[d][(hh << 2) | (sl << 1) | j] * inv, qb + gq * L.qs + col, h, col, D));
                 }
     }

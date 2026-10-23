@@ -454,11 +454,13 @@ __global__ __launch_bounds__(BQ / MMA_M * WARP) void volta_mma_kernel(
                 continue;
             }
             const float inv = 1.0f / fmaxf(l_run[half_i], 1e-30f);
+            // past the query limit: padding, zeros whatever its unwritten q, gate or bias rows hold
+            const bool pad = L.lims != nullptr && gq >= L.lims[N];
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 const int col = d * MMA_N + lc + j;
                 out[ob + gq * L.os + col] = __float2half(
-                    L.apply_gate(acc[d][half_i * 2 + j] * inv, qb + gq * L.qs + col, h, col, D));
+                    pad ? 0.f : L.apply_gate(acc[d][half_i * 2 + j] * inv, qb + gq * L.qs + col, h, col, D));
             }
         }
     }
