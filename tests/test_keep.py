@@ -87,8 +87,9 @@ for case, m, live in cases:
       tri = f32(c, m, s=20.)
       g = (sc, of, f32(c, s=.1, mean=1.), f32(c, s=.1), f(c, c, s=.1), f(c, s=.1), f(c, c, s=.1), f(c, s=.1))
       for add in (False, True):
+        # the product reads as zeros where keep leaves a row out (a live contraction does not write it)
         check_keep(f"trimul_epilogue_ln {c} add_input={add} {case}", [ep(tri, x, *g, keep, add_input=add)],
-                   [ep(tri, x, *g, add_input=add)], keep, [x if add else zero])
+                   [ep(jnp.where(keep > 0, tri, 0), x, *g, add_input=add)], keep, [x if add else zero])
       gdp = fused_ops.ln_gated_dual_proj(gc, dt, c, c)
       gw = (sc, of, f(c, 2 * c, s=.1), f(2 * c, s=.1), f(c, 2 * c, s=.1), f(2 * c, s=.1))
       out, ref = gdp(x, *gw, keep), tm.ref_ln_gdp(x, *gw, keep)

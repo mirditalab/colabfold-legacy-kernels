@@ -244,14 +244,17 @@ __device__ __forceinline__ void ln_rows(__half* s, const float* __restrict__ sca
 template <int R, int C, int S_LD>
 __device__ __forceinline__ void ln_columns(__half* s, float* red, const float* __restrict__ x_cm,
                                            int M, int m0, const float* __restrict__ scale,
-                                           const float* __restrict__ offset, float eps) {
+                                           const float* __restrict__ offset, float eps,
+                                           const __half* __restrict__ keep = nullptr) {
     constexpr int G = kThreads / R, V = C / G;
     static_assert(kThreads % R == 0 && C % (2 * G) == 0, "a thread takes channel pairs");
     const int r = threadIdx.x % R, g = threadIdx.x / R, gm = m0 + r;
+    // a row keep leaves out reads as zeros: a contraction over the live length does not write it
+    const bool in = gm < M && (keep == nullptr || __half2float(keep[gm]) > 0.f);
     float v[V], sum = 0.f;
 #pragma unroll
     for (int i = 0; i < V; ++i) {
-        v[i] = gm < M ? x_cm[(long long)(g * V + i) * M + gm] : 0.f;
+        v[i] = in ? x_cm[(long long)(g * V + i) * M + gm] : 0.f;
         sum += v[i];
     }
     red[g * R + r] = sum;

@@ -331,7 +331,7 @@ __global__ __launch_bounds__(kThreads) void epilogue_kernel(EpilogueArgs a) {
         return;
     }
     load_rows<BM, CA, AS_LD>(As, a.x, CA, m0, 0, a.M);
-    ln_columns<BM, C, YS_LD>(Ys, red, a.x_cm, a.M, m0, a.ln_scale, a.ln_offset, a.eps);
+    ln_columns<BM, C, YS_LD>(Ys, red, a.x_cm, a.M, m0, a.ln_scale, a.ln_offset, a.eps, a.keep);
     ln_rows<BM, CA, AS_LD>(As, a.in_scale, a.in_offset, a.eps);
 
     for (int o0 = 0; o0 < a.O; o0 += kTileN) {
