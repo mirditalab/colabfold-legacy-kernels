@@ -48,6 +48,16 @@ constexpr int kMaxHeads = 8;
 // The transition's hidden activation stays in shared memory, kHidden columns at a time.
 constexpr int kHidden = 64;
 
+// The outer product mean on 16 MSA rows: a block owns kOpmB rows b and kOpmD columns d, a warp per
+// d, AF2's kOpmE inner channels, left staged kOpmChunk outer channels at a time.
+constexpr int kOpmRows = 16;
+constexpr int kOpmB = 16;
+constexpr int kOpmD = 4;
+constexpr int kOpmE = 32;
+constexpr int kOpmChunk = 16;
+constexpr int kLtLd = kOpmRows + 8;
+static_assert(kOpmE == kTileK, "w streams one outer channel's rows as one weight tile");
+
 struct LnGdpArgs {
     const __half *x, *wpT, *bp, *wgT, *bg, *mask; // x [M,K], wpT/wgT [P,K], bp/bg [P], mask [M]
     const float *scale, *offset;                  // [K]
@@ -85,6 +95,20 @@ struct TransitionArgs {
     __half* out;                 // [M, C]
     int M, H;
     float eps;
+};
+
+struct OpmUpdateArgs {
+    const __half *lhs, *t, *residual; // lhs [B,K], t [K,D,F], residual [B,D,F] or null
+    const float *bias, *norm;         // bias [F], norm [B,D]
+    __half* out;                      // [B,D,F]
+    int B, K, D;
+    float eps;
+};
+
+struct OpmOuterArgs {
+    const __half *left, *right, *wT; // left [16,B,C], right [16,D,kOpmE], wT [F,C*kOpmE]
+    __half* out;                     // [B,D,F]
+    int B, C, D;
 };
 
 // What a row tile does, as the Pallas kernels' unless_padding: compute it when a row of keep is above
@@ -157,6 +181,26 @@ __device__ __forceinline__ void load_rows(__half* s, const __half* __restrict__ 
             v = *reinterpret_cast<const uint4*>(g + (long long)(r0 + r) * ld + c0 + c);
         }
         *reinterpret_cast<uint4*>(s + r * S_LD + c) = v;
+    }
+}
+
+// left[a, b0 + b, c0 + j] of left [16, B, C] to Lt[j][b][a] for the kOpmChunk channels from c0,
+// rows past B zero: for a fixed channel, the [b][a] tile of an A operand.
+__device__ __forceinline__ void stage_left(__half* Lt, const __half* __restrict__ left, int B,
+                                           int C, int b0, int c0) {
+    constexpr int V = kOpmChunk / 8;
+    for (int i = threadIdx.x; i < kOpmRows * kOpmB * V; i += kThreads) {
+        const int v = i % V, b = i / V % kOpmB, r = i / V / kOpmB;
+        uint4 x = make_uint4(0u, 0u, 0u, 0u);
+        if (b0 + b < B) {
+            x = *reinterpret_cast<const uint4*>(left + ((long long)r * B + b0 + b) * C + c0 +
+                                                v * 8);
+        }
+        const __half* h = reinterpret_cast<const __half*>(&x);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            Lt[((v * 8 + j) * kOpmB + b) * kLtLd + r] = h[j];
+        }
     }
 }
 

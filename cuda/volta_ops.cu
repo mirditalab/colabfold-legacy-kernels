@@ -290,6 +290,15 @@ __device__ __forceinline__ FragB frag_b(const __half* s, int ld, int n0, int k) 
     return b;
 }
 
+// The same fragment from a tile stored [k][n].
+__device__ __forceinline__ FragB frag_b_kn(const __half* s, int ld, int n0, int k) {
+    const int lane = threadIdx.x & (WARP - 1), lr = lane >> 2, lc = (lane & 3) * 2;
+    FragB b;
+    b[0] = reinterpret_cast<const cutlass::half_t&>(s[(k + lc) * ld + n0 + lr]);
+    b[1] = reinterpret_cast<const cutlass::half_t&>(s[(k + lc + 1) * ld + n0 + lr]);
+    return b;
+}
+
 // acc[nt] += S[r0, r0+16) . W for columns n0 + 8 nt of the tile [o0, o0+kTileN) of wT [N][K],
 // streamed through Ws [kTileN][kWsLd]. Every thread of the block must call it.
 template <int K, int NN>
@@ -629,6 +638,157 @@ template <int C, bool ADD> void launch_transition(cudaStream_t stream, const Tra
     constexpr int BM = transition_rows<C>();
     const dim3 grid((a.M + BM - 1) / BM);
     transition_kernel<C, ADD><<<grid, kThreads, transition_smem<C>(), stream>>>(a);
+}
+
+template <int F> constexpr size_t opm_update_smem() {
+    return (kRows * kWsLd + kTileK * (F + 8)) * sizeof(__half);
+}
+
+// A block owns 64 rows b of one column d: lhs and t[:, d] stream past in kTileK-deep tiles, then
+// the bias, the mask norm and the residual on the fp32 [64, F] product.
+template <int F> __global__ __launch_bounds__(kThreads) void opm_update_kernel(OpmUpdateArgs a) {
+    constexpr int BM = kRows, NN = F / 8, TS_LD = F + 8;
+    const int lane = threadIdx.x & (WARP - 1), warp = threadIdx.x / WARP;
+    const int lr = lane >> 2, lc = (lane & 3) * 2;
+    const int m0 = blockIdx.x * BM, d = blockIdx.y;
+
+    extern __shared__ __align__(16) char smem[];
+    __half* As = reinterpret_cast<__half*>(smem); // [BM][kWsLd] lhs
+    __half* Ts = As + BM * kWsLd;                 // [kTileK][TS_LD] t[:, d]
+
+    FragC acc[NN];
+    clear<NN>(acc);
+    MmaOp mma;
+    for (int k0 = 0; k0 < a.K; k0 += kTileK) {
+        __syncthreads();
+        load_rows<BM, kTileK, kWsLd>(As, a.lhs, a.K, m0, k0, a.B);
+        load_rows<kTileK, F, TS_LD>(Ts, a.t, a.D * F, k0, d * F, INT_MAX);
+        __syncthreads();
+#pragma unroll
+        for (int ks = 0; ks < kTileK; ks += 8) {
+            const FragA fa = frag_a(As, kWsLd, warp * 16, ks);
+#pragma unroll
+            for (int nt = 0; nt < NN; ++nt) {
+                mma(acc[nt], fa, frag_b_kn(Ts, TS_LD, nt * 8, ks), acc[nt]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int hi = 0; hi < 2; ++hi) {
+        const int b = m0 + warp * 16 + lr + hi * 8;
+        if (b >= a.B) {
+            continue;
+        }
+        const long long row = (long long)b * a.D + d;
+        const float den = a.eps + a.norm[row];
+#pragma unroll
+        for (int nt = 0; nt < NN; ++nt) {
+            const int n = nt * 8 + lc;
+            float v0 = (acc[nt][hi * 2] + a.bias[n]) / den;
+            float v1 = (acc[nt][hi * 2 + 1] + a.bias[n + 1]) / den;
+            if (a.residual) {
+                const float2 r =
+                    __half22float2(*reinterpret_cast<const __half2*>(a.residual + row * F + n));
+                v0 += r.x;
+                v1 += r.y;
+            }
+            *reinterpret_cast<__half2*>(a.out + row * F + n) = __floats2half2_rn(v0, v1);
+        }
+    }
+}
+
+template <int F> void launch_opm_update(cudaStream_t stream, const OpmUpdateArgs& a) {
+    const dim3 grid((a.B + kRows - 1) / kRows, a.D);
+    opm_update_kernel<F><<<grid, kThreads, opm_update_smem<F>(), stream>>>(a);
+}
+
+template <int F> constexpr size_t opm_outer_smem() {
+    return (kOpmChunk * kOpmB * kLtLd + F * kWsLd) * sizeof(__half);
+}
+
+// A block owns kOpmB rows b and kOpmD columns d, warp w the rows (b, d0 + w). Per outer channel c,
+// g[b, e] = sum_a left[a, b, c] right[a, d, e] over the 16 MSA rows, rounded to f16 in the
+// registers (m16n8k8's accumulator layout is its A layout), times w[c*E + e, :] into the fp32
+// [16, F] output; the [B, C*E, D] product is never written.
+template <int F> __global__ __launch_bounds__(kThreads) void opm_outer_kernel(OpmOuterArgs a) {
+    constexpr int NN = F / 8, NE = kOpmE / 8;
+    const int lane = threadIdx.x & (WARP - 1), warp = threadIdx.x / WARP;
+    const int lr = lane >> 2, lc = (lane & 3) * 2;
+    const int b0 = blockIdx.x * kOpmB, d = blockIdx.y * kOpmD + warp;
+
+    extern __shared__ __align__(16) char smem[];
+    __half* Lt = reinterpret_cast<__half*>(smem); // left[a, b, c] at [c][b][a], kOpmChunk channels
+    __half* Ws = Lt + kOpmChunk * kOpmB * kLtLd;  // [F][kWsLd] w's rows for one c, transposed
+
+    // right[:, d] as B fragments, k = a and n = e, the same for every c
+    FragB rf[kOpmRows / 8][NE];
+#pragma unroll
+    for (int ks = 0; ks < kOpmRows / 8; ++ks) {
+#pragma unroll
+        for (int nt = 0; nt < NE; ++nt) {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                rf[ks][nt][j] = reinterpret_cast<const cutlass::half_t&>(
+                    a.right[((long long)(ks * 8 + lc + j) * a.D + d) * kOpmE + nt * 8 + lr]);
+            }
+        }
+    }
+
+    FragC acc[NN];
+    clear<NN>(acc);
+    MmaOp mma;
+    for (int c = 0; c < a.C; ++c) {
+        const int cl = c % kOpmChunk;
+        __syncthreads();
+        if (cl == 0) {
+            stage_left(Lt, a.left, a.B, a.C, b0, c);
+        }
+        load_rows<F, kOpmE, kWsLd>(Ws, a.wT, a.C * kOpmE, 0, c * kOpmE, INT_MAX);
+        __syncthreads();
+
+        FragC g[NE];
+        clear<NE>(g);
+#pragma unroll
+        for (int ks = 0; ks < kOpmRows / 8; ++ks) {
+            const FragA fl = frag_a(Lt + cl * kOpmB * kLtLd, kLtLd, 0, ks * 8);
+#pragma unroll
+            for (int nt = 0; nt < NE; ++nt) {
+                mma(g[nt], fl, rf[ks][nt], g[nt]);
+            }
+        }
+#pragma unroll
+        for (int ke = 0; ke < NE; ++ke) {
+            FragA fg;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                fg[i] = cutlass::half_t(g[ke][i]);
+            }
+#pragma unroll
+            for (int nt = 0; nt < NN; ++nt) {
+                mma(acc[nt], fg, frag_b(Ws, kWsLd, nt * 8, ke * 8), acc[nt]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int hi = 0; hi < 2; ++hi) {
+        const int b = b0 + lr + hi * 8;
+        if (b >= a.B) {
+            continue;
+        }
+        __half* o = a.out + ((long long)b * a.D + d) * F;
+#pragma unroll
+        for (int nt = 0; nt < NN; ++nt) {
+            *reinterpret_cast<__half2*>(o + nt * 8 + lc) =
+                __floats2half2_rn(acc[nt][hi * 2], acc[nt][hi * 2 + 1]);
+        }
+    }
+}
+
+template <int F> void launch_opm_outer(cudaStream_t stream, const OpmOuterArgs& a) {
+    const dim3 grid((a.B + kOpmB - 1) / kOpmB, a.D / kOpmD);
+    opm_outer_kernel<F><<<grid, kThreads, opm_outer_smem<F>(), stream>>>(a);
 }
 
 

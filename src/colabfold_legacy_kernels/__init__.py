@@ -55,6 +55,15 @@ _TABLE = {
         (75, "libvolta_ops.so", "VoltaTransition"),
         (70, "libvolta_gdp_wmma.so", "VoltaTransitionWmma"),
     ),
+    # the outer product mean: the pair update on a shallow MSA, the in-order product on 16 rows
+    "opm_update": (
+        (75, "libvolta_ops.so", "VoltaOpmUpdate"),
+        (70, "libvolta_gdp_wmma.so", "VoltaOpmUpdateWmma"),
+    ),
+    "opm_outer": (
+        (75, "libvolta_ops.so", "VoltaOpmOuter"),
+        (70, "libvolta_gdp_wmma.so", "VoltaOpmOuterWmma"),
+    ),
 }
 
 KERNELS = tuple(_TABLE)

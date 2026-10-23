@@ -544,5 +544,181 @@ template <int C, bool ADD> void launch_transition(cudaStream_t stream, const Tra
     transition_kernel<C, ADD><<<grid, kThreads, transition_smem<C>(), stream>>>(a);
 }
 
+// B from a tile stored [k][n].
+using FragBr = wmma::fragment<wmma::matrix_b, FRAG, FRAG, FRAG, __half, wmma::row_major>;
+
+__host__ __device__ constexpr size_t opm_as() {
+    return align32(kRows * kWsLd * sizeof(__half));
+}
+template <int F> __host__ __device__ constexpr size_t opm_ts() {
+    return align32(kTileK * (F + 8) * sizeof(__half));
+}
+template <int F> __host__ __device__ constexpr size_t opm_update_smem() {
+    return opm_as() + opm_ts<F>() + kThreads / WARP * kScratch * sizeof(float);
+}
+
+// See volta_ops.cu: 64 rows b of one column d, lhs and t[:, d] streamed in kTileK-deep tiles.
+template <int F> __global__ __launch_bounds__(kThreads) void opm_update_kernel(OpmUpdateArgs a) {
+    constexpr int BM = kRows, NF = F / FRAG, TS_LD = F + 8;
+    const int lane = threadIdx.x & (WARP - 1), warp = threadIdx.x / WARP;
+    const int m0 = blockIdx.x * BM, d = blockIdx.y;
+
+    extern __shared__ __align__(128) char smem[];
+    __half* As = reinterpret_cast<__half*>(smem);            // [BM][kWsLd] lhs
+    __half* Ts = reinterpret_cast<__half*>(smem + opm_as()); // [kTileK][TS_LD] t[:, d]
+    float* ep = reinterpret_cast<float*>(smem + opm_as() + opm_ts<F>()) + warp * kScratch;
+
+    Acc acc[NF];
+    clear<NF>(acc);
+    for (int k0 = 0; k0 < a.K; k0 += kTileK) {
+        __syncthreads();
+        load_rows<BM, kTileK, kWsLd>(As, a.lhs, a.K, m0, k0, a.B);
+        load_rows<kTileK, F, TS_LD>(Ts, a.t, a.D * F, k0, d * F, INT_MAX);
+        __syncthreads();
+#pragma unroll
+        for (int ks = 0; ks < kTileK; ks += FRAG) {
+            FragA fa;
+            wmma::load_matrix_sync(fa, As + warp * FRAG * kWsLd + ks, kWsLd);
+#pragma unroll
+            for (int f = 0; f < NF; ++f) {
+                FragBr fb;
+                wmma::load_matrix_sync(fb, Ts + ks * TS_LD + f * FRAG, TS_LD);
+                wmma::mma_sync(acc[f], fa, fb, acc[f]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int f = 0; f < NF; ++f) {
+        // row major: value lane + 32 t is row i / 16, column i % 16
+        float v[kScratch / WARP];
+        read_back(v, ep, acc[f], wmma::mem_row_major);
+#pragma unroll
+        for (int t = 0; t < kScratch / WARP; ++t) {
+            const int i = lane + t * WARP, b = m0 + warp * FRAG + i / FRAG, n = f * FRAG + i % FRAG;
+            if (b >= a.B) {
+                continue;
+            }
+            const long long row = (long long)b * a.D + d;
+            float out = (v[t] + a.bias[n]) / (a.eps + a.norm[row]);
+            if (a.residual) {
+                out += __half2float(a.residual[row * F + n]);
+            }
+            a.out[row * F + n] = __float2half(out);
+        }
+    }
+}
+
+template <int F> void launch_opm_update(cudaStream_t stream, const OpmUpdateArgs& a) {
+    const dim3 grid((a.B + kRows - 1) / kRows, a.D);
+    opm_update_kernel<F><<<grid, kThreads, opm_update_smem<F>(), stream>>>(a);
+}
+
+constexpr int kGLd = kOpmE + 8;
+
+__host__ __device__ constexpr size_t opm_lt() {
+    return align32(kOpmChunk * kOpmB * kLtLd * sizeof(__half));
+}
+template <int F> __host__ __device__ constexpr size_t opm_ws() {
+    return align32(F * kWsLd * sizeof(__half));
+}
+__host__ __device__ constexpr size_t opm_rs() {
+    return align32(kOpmRows * (kOpmD * kOpmE + 8) * sizeof(__half));
+}
+__host__ __device__ constexpr size_t opm_gs() {
+    return align32(kOpmB * kGLd * sizeof(__half));
+}
+template <int F> __host__ __device__ constexpr size_t opm_outer_smem() {
+    return opm_lt() + opm_ws<F>() + opm_rs() +
+           kThreads / WARP * (opm_gs() + kScratch * sizeof(float));
+}
+
+// See volta_ops.cu: kOpmB rows b and kOpmD columns d a block, warp w the rows (b, d0 + w). The
+// accumulator layout is not known, thus each channel's g goes to f16 through the warp's scratch.
+template <int F> __global__ __launch_bounds__(kThreads) void opm_outer_kernel(OpmOuterArgs a) {
+    constexpr int NF = F / FRAG, NE = kOpmE / FRAG, RS_LD = kOpmD * kOpmE + 8;
+    const int lane = threadIdx.x & (WARP - 1), warp = threadIdx.x / WARP;
+    const int b0 = blockIdx.x * kOpmB, d0 = blockIdx.y * kOpmD, d = d0 + warp;
+
+    extern __shared__ __align__(128) char smem[];
+    char* p = smem;
+    __half* Lt = reinterpret_cast<__half*>(p); // left[a, b, c] at [c][b][a], kOpmChunk channels
+    p += opm_lt();
+    __half* Ws = reinterpret_cast<__half*>(p); // [F][kWsLd] w's rows for one c, transposed
+    p += opm_ws<F>();
+    __half* Rs = reinterpret_cast<__half*>(p); // [kOpmRows][RS_LD] right[:, d0 .. d0 + kOpmD]
+    p += opm_rs();
+    __half* Gs = reinterpret_cast<__half*>(p + warp * opm_gs()); // [kOpmB][kGLd] g in f16
+    float* ep = reinterpret_cast<float*>(p + kThreads / WARP * opm_gs()) + warp * kScratch;
+
+    // right[:, d] as B fragments, k = a and n = e, the same for every c
+    load_rows<kOpmRows, kOpmD * kOpmE, RS_LD>(Rs, a.right, a.D * kOpmE, 0, d0 * kOpmE, INT_MAX);
+    __syncthreads();
+    FragBr rf[NE];
+#pragma unroll
+    for (int e = 0; e < NE; ++e) {
+        wmma::load_matrix_sync(rf[e], Rs + warp * kOpmE + e * FRAG, RS_LD);
+    }
+
+    Acc acc[NF];
+    clear<NF>(acc);
+    for (int c = 0; c < a.C; ++c) {
+        const int cl = c % kOpmChunk;
+        __syncthreads();
+        if (cl == 0) {
+            stage_left(Lt, a.left, a.B, a.C, b0, c);
+        }
+        load_rows<F, kOpmE, kWsLd>(Ws, a.wT, a.C * kOpmE, 0, c * kOpmE, INT_MAX);
+        __syncthreads();
+
+        FragA fl;
+        wmma::load_matrix_sync(fl, Lt + cl * kOpmB * kLtLd, kLtLd);
+#pragma unroll
+        for (int e = 0; e < NE; ++e) {
+            Acc g;
+            wmma::fill_fragment(g, 0.f);
+            wmma::mma_sync(g, fl, rf[e], g);
+            float v[kScratch / WARP];
+            read_back(v, ep, g, wmma::mem_row_major);
+#pragma unroll
+            for (int t = 0; t < kScratch / WARP; ++t) {
+                const int i = lane + t * WARP;
+                Gs[i / FRAG * kGLd + e * FRAG + i % FRAG] = __float2half(v[t]);
+            }
+        }
+        __syncwarp();
+#pragma unroll
+        for (int e = 0; e < NE; ++e) {
+            FragA fg;
+            wmma::load_matrix_sync(fg, Gs + e * FRAG, kGLd);
+#pragma unroll
+            for (int f = 0; f < NF; ++f) {
+                // col_major: B(k, n) at n * ld + k, which is the [n][k] tile
+                FragB fb;
+                wmma::load_matrix_sync(fb, Ws + f * FRAG * kWsLd + e * FRAG, kWsLd);
+                wmma::mma_sync(acc[f], fg, fb, acc[f]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int f = 0; f < NF; ++f) {
+        float v[kScratch / WARP];
+        read_back(v, ep, acc[f], wmma::mem_row_major);
+#pragma unroll
+        for (int t = 0; t < kScratch / WARP; ++t) {
+            const int i = lane + t * WARP, b = b0 + i / FRAG;
+            if (b < a.B) {
+                a.out[((long long)b * a.D + d) * F + f * FRAG + i % FRAG] = __float2half(v[t]);
+            }
+        }
+    }
+}
+
+template <int F> void launch_opm_outer(cudaStream_t stream, const OpmOuterArgs& a) {
+    const dim3 grid((a.B + kOpmB - 1) / kOpmB, a.D / kOpmD);
+    opm_outer_kernel<F><<<grid, kThreads, opm_outer_smem<F>(), stream>>>(a);
+}
+
 #define FUSED_SYM(name) name##Wmma
 #include "volta_fused_ffi.h"

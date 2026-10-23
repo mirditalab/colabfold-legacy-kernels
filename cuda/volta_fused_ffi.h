@@ -1,5 +1,6 @@
 // The FFI handlers of the fused units. The including unit defines launch_ln_gdp, launch_epilogue,
-// launch_proj and launch_transition for its family, and FUSED_SYM, which names a handler for it.
+// launch_proj, launch_transition, launch_opm_update and launch_opm_outer for its family, and
+// FUSED_SYM, which names a handler for it.
 #pragma once
 
 #include <string>
@@ -19,6 +20,10 @@ static bool fused_width(int64_t c) {
 }
 static bool msa_width(int64_t c) {
     return fused_width(c) || c == 256;
+}
+// The outer product mean's output channels: a power of two from 16 to 128.
+static bool opm_width(int64_t f) {
+    return f == 16 || f == 32 || f == 64 || f == 128;
 }
 
 // keep [M] when has_keep (else a one-element buffer): see tile_work in volta_gdp.h.
@@ -253,6 +258,82 @@ static ffi::Error TransitionImpl(cudaStream_t stream, F16 x, F32 scale, F32 offs
     return launch_status("transition");
 }
 
+// out [B,D,F] = (lhs@t[:, d] + bias) / (eps + norm[b, d]), + residual with has_residual (else a
+// one-element buffer).
+static ffi::Error OpmUpdateImpl(cudaStream_t stream, F16 lhs, F16 t, F32 bias, F32 norm,
+                                F16 residual, ffi::Result<F16> out, float eps, bool has_residual) {
+    auto dl = lhs.dimensions(), dt = t.dimensions();
+    if (dl.size() != 2 || dt.size() != 3 || dt[0] != dl[1]) {
+        return ffi::Error::InvalidArgument("opm_update: lhs must be [B,K] and t [K,D,F]");
+    }
+    const int64_t B = dl[0], K = dl[1], D = dt[1], F = dt[2];
+    if (K % kTileK || !opm_width(F) || D > 65535) {
+        return ffi::Error::InvalidArgument(
+            "opm_update: K must be a multiple of 32, F 16, 32, 64 or 128, D at most 65535");
+    }
+    if (bias.element_count() != (size_t)F || norm.element_count() != (size_t)(B * D) ||
+        out->element_count() != (size_t)(B * D * F) ||
+        (has_residual && residual.element_count() != (size_t)(B * D * F))) {
+        return ffi::Error::InvalidArgument("opm_update: shapes do not match");
+    }
+    if (B == 0 || D == 0) {
+        return ffi::Error::Success();
+    }
+    auto f16 = [](auto& b) { return reinterpret_cast<const __half*>(b.typed_data()); };
+    const OpmUpdateArgs a{f16(lhs),
+                          f16(t),
+                          has_residual ? f16(residual) : nullptr,
+                          bias.typed_data(),
+                          norm.typed_data(),
+                          reinterpret_cast<__half*>(out->typed_data()),
+                          (int)B,
+                          (int)K,
+                          (int)D,
+                          eps};
+    (F == 16   ? launch_opm_update<16>
+     : F == 32 ? launch_opm_update<32>
+     : F == 64 ? launch_opm_update<64>
+               : launch_opm_update<128>)(stream, a);
+    return launch_status("opm_update");
+}
+
+// out [B,D,F] = sum over c, e of f16(sum_a left[a,b,c] right[a,d,e]) w[c*E + e, f] on 16 rows a,
+// E = 32; the weights come transposed, wT [F, C*E].
+static ffi::Error OpmOuterImpl(cudaStream_t stream, F16 left, F16 right, F16 wT,
+                               ffi::Result<F16> out) {
+    auto dl = left.dimensions(), dr = right.dimensions(), dw = wT.dimensions();
+    if (dl.size() != 3 || dr.size() != 3 || dw.size() != 2 || dl[0] != kOpmRows ||
+        dr[0] != kOpmRows) {
+        return ffi::Error::InvalidArgument(
+            "opm_outer: left must be [16,B,C], right [16,D,E], wT [F,C*E]");
+    }
+    const int64_t B = dl[1], C = dl[2], D = dr[1], E = dr[2], F = dw[0];
+    if (C % kOpmChunk || E != kOpmE || D % kOpmD || D / kOpmD > 65535 || dw[1] != C * E ||
+        !opm_width(F)) {
+        return ffi::Error::InvalidArgument(
+            "opm_outer: C a multiple of 16, E 32, D a multiple of 4, F 16, 32, 64 or 128");
+    }
+    if (out->element_count() != (size_t)(B * D * F)) {
+        return ffi::Error::InvalidArgument("opm_outer: shapes do not match");
+    }
+    if (B == 0 || D == 0 || C == 0) {
+        return ffi::Error::Success();
+    }
+    auto f16 = [](auto& b) { return reinterpret_cast<const __half*>(b.typed_data()); };
+    const OpmOuterArgs a{f16(left),
+                         f16(right),
+                         f16(wT),
+                         reinterpret_cast<__half*>(out->typed_data()),
+                         (int)B,
+                         (int)C,
+                         (int)D};
+    (F == 16   ? launch_opm_outer<16>
+     : F == 32 ? launch_opm_outer<32>
+     : F == 64 ? launch_opm_outer<64>
+               : launch_opm_outer<128>)(stream, a);
+    return launch_status("opm_outer");
+}
+
 XLA_FFI_DEFINE_HANDLER_SYMBOL(FUSED_SYM(VoltaLnGdp), LnGdpImpl,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<cudaStream_t>>()
@@ -334,4 +415,26 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(FUSED_SYM(VoltaTransition), TransitionImpl,
                                   .Attr<float>("eps")
                                   .Attr<bool>("add_input")
                                   .Attr<bool>("has_keep"),
+                              {ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(FUSED_SYM(VoltaOpmUpdate), OpmUpdateImpl,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Arg<F16>()
+                                  .Arg<F16>()
+                                  .Arg<F32>()
+                                  .Arg<F32>()
+                                  .Arg<F16>()
+                                  .Ret<F16>()
+                                  .Attr<float>("eps")
+                                  .Attr<bool>("has_residual"),
+                              {ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(FUSED_SYM(VoltaOpmOuter), OpmOuterImpl,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Arg<F16>()
+                                  .Arg<F16>()
+                                  .Arg<F16>()
+                                  .Ret<F16>(),
                               {ffi::Traits::kCmdBufferCompatible});
