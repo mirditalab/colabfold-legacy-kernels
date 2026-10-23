@@ -261,7 +261,8 @@ static ffi::Error TransitionImpl(cudaStream_t stream, F16 x, F32 scale, F32 offs
 // out [B,D,F] = (lhs@t[:, d] + bias) / (eps + norm[b, d]), + residual with has_residual (else a
 // one-element buffer).
 static ffi::Error OpmUpdateImpl(cudaStream_t stream, F16 lhs, F16 t, F32 bias, F32 norm,
-                                F16 residual, ffi::Result<F16> out, float eps, bool has_residual) {
+                                F16 residual, F16 keep, ffi::Result<F16> out, float eps,
+                                bool has_residual, bool has_keep) {
     auto dl = lhs.dimensions(), dt = t.dimensions();
     if (dl.size() != 2 || dt.size() != 3 || dt[0] != dl[1]) {
         return ffi::Error::InvalidArgument("opm_update: lhs must be [B,K] and t [K,D,F]");
@@ -273,7 +274,8 @@ static ffi::Error OpmUpdateImpl(cudaStream_t stream, F16 lhs, F16 t, F32 bias, F
     }
     if (bias.element_count() != (size_t)F || norm.element_count() != (size_t)(B * D) ||
         out->element_count() != (size_t)(B * D * F) ||
-        (has_residual && residual.element_count() != (size_t)(B * D * F))) {
+        (has_residual && residual.element_count() != (size_t)(B * D * F)) ||
+        (has_keep && (!has_residual || keep.element_count() != (size_t)(B * D)))) {
         return ffi::Error::InvalidArgument("opm_update: shapes do not match");
     }
     if (B == 0 || D == 0) {
@@ -283,6 +285,7 @@ static ffi::Error OpmUpdateImpl(cudaStream_t stream, F16 lhs, F16 t, F32 bias, F
     const OpmUpdateArgs a{f16(lhs),
                           f16(t),
                           has_residual ? f16(residual) : nullptr,
+                          keep_rows(keep, has_keep),
                           bias.typed_data(),
                           norm.typed_data(),
                           reinterpret_cast<__half*>(out->typed_data()),
@@ -425,9 +428,11 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(FUSED_SYM(VoltaOpmUpdate), OpmUpdateImpl,
                                   .Arg<F32>()
                                   .Arg<F32>()
                                   .Arg<F16>()
+                                  .Arg<F16>()
                                   .Ret<F16>()
                                   .Attr<float>("eps")
-                                  .Attr<bool>("has_residual"),
+                                  .Attr<bool>("has_residual")
+                                  .Attr<bool>("has_keep"),
                               {ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(FUSED_SYM(VoltaOpmOuter), OpmOuterImpl,

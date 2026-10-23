@@ -4,7 +4,8 @@
 
 With keep, real rows are bit-identical to the call without it, padded rows either that or what a skipped block writes
 (zeros, or the residual unchanged where the output aliases it), all finite. A keep below zero past the live block: those
-blocks are not written. ln_gated_dual_proj takes its mask as the keep.
+blocks are not written. ln_gated_dual_proj takes its mask as the keep. opm_update keeps the residual in the blocks
+keep leaves out.
 """
 import os
 import sys
@@ -137,6 +138,23 @@ for S, n in [(256, 200), (384, 129), (192, 65)]:
         flush=True)
   if not ok:
     fails.append(f"keep below zero S={S} n={n}")
+
+# opm_update with keep: kept blocks as without it, the others the residual unchanged
+up = fused_ops.opm_update(gc, dt, 32, 128)
+B, n = 300, 211
+tok = jnp.arange(B) < n
+keep = (tok[:, None] & tok[None, :]).astype(dt)
+lhs, t, bias, res = f(B, 32), f(32, B, 128, s=.2), f32(128, s=.1), f(B, B, 128)
+norm = keep.astype(jnp.float32)
+kp = np.asarray(up(lhs, t, bias, norm, res + 0, keep).astype(jnp.float32))
+pp = np.asarray(up(lhs, t, bias, norm, res + 0).astype(jnp.float32))
+rows = np.zeros((-(-B // 64) * 64, B))
+rows[:B] = np.asarray(keep.astype(jnp.float32))
+blocks = np.repeat(rows.reshape(-1, 64, B).max(axis=1) > 0, 64, axis=0)[:B]
+ok = bool((kp[blocks] == pp[blocks]).all() and (kp[~blocks] == np.asarray(res.astype(jnp.float32))[~blocks]).all())
+print(f"{'ok  ' if ok else 'BAD '}opm_update keep B={B} n={n}: kept blocks as without, the rest the residual", flush=True)
+if not ok:
+  fails.append("opm_update keep")
 
 print("RESULT:", "PASS" if not fails else f"FAIL ({len(fails)})")
 sys.exit(bool(fails))

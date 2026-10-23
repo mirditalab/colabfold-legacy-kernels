@@ -562,6 +562,15 @@ template <int F> __global__ __launch_bounds__(kThreads) void opm_update_kernel(O
     constexpr int BM = kRows, NF = F / FRAG, TS_LD = F + 8;
     const int lane = threadIdx.x & (WARP - 1), warp = threadIdx.x / WARP;
     const int m0 = blockIdx.x * BM, d = blockIdx.y;
+    if (a.keep != nullptr) { // the bucket's padding: the output aliases the residual, which it keeps
+        bool live = false;
+        for (int r = threadIdx.x; r < BM; r += kThreads) {
+            live |= m0 + r < a.B && __half2float(a.keep[(long long)(m0 + r) * a.D + d]) > 0.f;
+        }
+        if (!__syncthreads_or(live)) {
+            return;
+        }
+    }
 
     extern __shared__ __align__(128) char smem[];
     __half* As = reinterpret_cast<__half*>(smem);            // [BM][kWsLd] lhs

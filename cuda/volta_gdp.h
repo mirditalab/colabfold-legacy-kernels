@@ -99,6 +99,7 @@ struct TransitionArgs {
 
 struct OpmUpdateArgs {
     const __half *lhs, *t, *residual; // lhs [B,K], t [K,D,F], residual [B,D,F] or null
+    const __half* keep;               // [B,D] or null: a block with none above zero keeps the residual
     const float *bias, *norm;         // bias [F], norm [B,D]
     __half* out;                      // [B,D,F]
     int B, K, D;
