@@ -31,6 +31,8 @@ bad = 0
 
 ROWS = (1, 59, 4101, 260 * 260)
 WIDTHS = ((128, 128), (64, 64), (128, 64))   # (pair channels, intermediate / packed slot width)
+# the tri-mul's wider pairs (Protenix-v2, Mol-1)
+WIDE = ((256, 256), (320, 320), (448, 448))
 
 
 def rel(a, b):
@@ -90,7 +92,8 @@ for kernel in ("ln_gated_dual_proj", "trimul_epilogue", "ln_projection", "output
 
 # ---- ln_gated_dual_proj and trimul_epilogue_ln -------------------------------
 ep_ln = fused_ops.trimul_epilogue_ln(gc, dt)
-for a, ci in WIDTHS:
+# the wide pairs only where the card has their shared memory (a T4 has none for 448)
+for a, ci in WIDTHS + tuple(w for w in WIDE if V.ln_gdp_supported(*w)):
   gdp = fused_ops.ln_gated_dual_proj(gc, dt, a, ci)
   if gdp is None or ep_ln is None:
     report(f"ln_gdp / epilogue a={a} ci={ci}: no kernel selected", float("inf"))
@@ -122,7 +125,7 @@ for a, ci in WIDTHS:
                  lambda *z: tm.ref_trimul_epilogue_ln(*z, add_input=True), eargs, [0, 1, 2, 6])
 
 # the whole fused triangle multiplication, as AF2's _ln_fused_triangle_multiplication chains it
-for a, ci in WIDTHS[:2]:
+for a, ci in WIDTHS[:2] + tuple(w for w in WIDE[1:2] if V.ln_gdp_supported(*w)):
   gdp = fused_ops.ln_gated_dual_proj(gc, dt, a, ci)
   for n in (59, 260):
     x, mask = f(n * n, a, s=2.), jnp.asarray(rng.uniform(size=n * n) > .1, dt)
@@ -233,7 +236,8 @@ for c, factor in ((128, 4), (64, 2), (64, 4), (256, 4)):
                  lambda *z: tr.ref_transition(*z, add_input=True), args, [0, 1, 3, 5])
 
 # other widths decline to the caller's own path
-declined = (fused_ops.ln_gated_dual_proj(gc, dt, 256, 128), fused_ops.ln_projection(gc, dt, 128, 32),
+declined = (fused_ops.ln_gated_dual_proj(gc, dt, 256, 128), fused_ops.ln_gated_dual_proj(gc, dt, 512, 512),
+            fused_ops.ln_projection(gc, dt, 128, 32),
             fused_ops.output_projection(gc, dt, 256, 256), fused_ops.ln_projection(gc, dt, 256, 256),
             fused_ops.ln_projection(gc, jnp.bfloat16, 128, 128),
             fused_ops.transition(gc, dt, 512, 2048), fused_ops.transition(gc, dt, 128, 384))

@@ -21,6 +21,11 @@ static bool fused_width(int64_t c) {
 static bool msa_width(int64_t c) {
     return fused_width(c) || c == 256;
 }
+// The tri-mul's wider pairs (Protenix-v2 256, Mol-1 320 and 448), input and hidden widths equal;
+// whether the card has the shared memory is the caller's check.
+static bool wide_trimul_width(int64_t c) {
+    return c == 256 || c == 320 || c == 448;
+}
 // The outer product mean's output channels: a power of two from 16 to 128.
 static bool opm_width(int64_t f) {
     return f == 16 || f == 32 || f == 64 || f == 128;
@@ -49,8 +54,9 @@ static ffi::Error LnGdpImpl(cudaStream_t stream, F16 x, F32 scale, F32 offset, F
         return ffi::Error::InvalidArgument("ln_gdp: x must be [M,K] and wpT [P,K]");
     }
     const int64_t M = dx[0], K = dx[1], P = dw[0];
-    if (!fused_width(K) || P % 2 || !fused_width(P / 2)) {
-        return ffi::Error::InvalidArgument("ln_gdp: K and P/2 must be 64 or 128");
+    if (P % 2 || !(fused_width(K) && fused_width(P / 2) || wide_trimul_width(K) && P / 2 == K)) {
+        return ffi::Error::InvalidArgument(
+            "ln_gdp: K and P/2 must be 64 or 128, or both 256, 320 or 448");
     }
     if (wgT.element_count() != (size_t)(P * K) || bp.element_count() != (size_t)P ||
         bg.element_count() != (size_t)P || mask.element_count() != (size_t)M ||
@@ -75,7 +81,13 @@ static ffi::Error LnGdpImpl(cudaStream_t stream, F16 x, F32 scale, F32 offset, F
                       (int)M,
                       (int)P,
                       eps};
-    (K == 64 ? launch_ln_gdp<64> : launch_ln_gdp<128>)(stream, a);
+    switch (K) {
+    case 64: launch_ln_gdp<64>(stream, a); break;
+    case 128: launch_ln_gdp<128>(stream, a); break;
+    case 256: launch_ln_gdp<256>(stream, a); break;
+    case 320: launch_ln_gdp<320>(stream, a); break;
+    default: launch_ln_gdp<448>(stream, a);
+    }
     return launch_status("ln_gdp");
 }
 
@@ -85,6 +97,20 @@ static void epilogue_dispatch(cudaStream_t stream, const EpilogueArgs& a, int64_
         (add ? launch_epilogue<C, 64, true> : launch_epilogue<C, 64, false>)(stream, a);
     } else {
         (add ? launch_epilogue<C, 128, true> : launch_epilogue<C, 128, false>)(stream, a);
+    }
+}
+
+template <int C>
+static void wide_epilogue_launch(cudaStream_t stream, const EpilogueArgs& a, bool add) {
+    (add ? launch_epilogue<C, C, true> : launch_epilogue<C, C, false>)(stream, a);
+}
+
+static void wide_epilogue_dispatch(cudaStream_t stream, const EpilogueArgs& a, int64_t C,
+                                   bool add) {
+    switch (C) {
+    case 256: wide_epilogue_launch<256>(stream, a, add); break;
+    case 320: wide_epilogue_launch<320>(stream, a, add); break;
+    default: wide_epilogue_launch<448>(stream, a, add);
     }
 }
 
@@ -98,9 +124,10 @@ static ffi::Error TrimulEpilogueImpl(cudaStream_t stream, F32 x_cm, F16 x, F32 i
         return ffi::Error::InvalidArgument("trimul_epilogue: x_cm [C,M], x [M,CA], woT [O,C]");
     }
     const int64_t C = dc[0], M = dc[1], CA = dx[1], O = dw[0];
-    if (!fused_width(C) || !fused_width(CA) || !fused_width(O) || (add_input && O != CA)) {
-        return ffi::Error::InvalidArgument(
-            "trimul_epilogue: C, CA and O must be 64 or 128, O == CA with add_input");
+    const bool wide = wide_trimul_width(C) && CA == C && O == C;
+    if (!(fused_width(C) && fused_width(CA) && fused_width(O) || wide) || (add_input && O != CA)) {
+        return ffi::Error::InvalidArgument("trimul_epilogue: C, CA and O must be 64 or 128, or all "
+                                           "256, 320 or 448; O == CA with add_input");
     }
     if (wgT.element_count() != (size_t)(O * CA) || bo.element_count() != (size_t)O ||
         bg.element_count() != (size_t)O || in_scale.element_count() != (size_t)CA ||
@@ -128,7 +155,11 @@ static ffi::Error TrimulEpilogueImpl(cudaStream_t stream, F32 x_cm, F16 x, F32 i
                          (int)M,
                          (int)O,
                          eps};
-    (C == 64 ? epilogue_dispatch<64> : epilogue_dispatch<128>)(stream, a, CA, add_input);
+    if (wide) {
+        wide_epilogue_dispatch(stream, a, C, add_input);
+    } else {
+        (C == 64 ? epilogue_dispatch<64> : epilogue_dispatch<128>)(stream, a, CA, add_input);
+    }
     return launch_status("trimul_epilogue");
 }
 

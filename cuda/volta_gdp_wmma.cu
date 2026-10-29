@@ -287,6 +287,7 @@ template <int K> __global__ __launch_bounds__(kThreads) void ln_gdp_kernel(LnGdp
 
 template <int K> void launch_ln_gdp(cudaStream_t stream, const LnGdpArgs& a) {
     const dim3 grid((a.M + kRows - 1) / kRows);
+    smem_opt_in(ln_gdp_kernel<K>, ln_gdp_smem<K>());
     ln_gdp_kernel<K><<<grid, kThreads, ln_gdp_smem<K>(), stream>>>(a);
 }
 
@@ -367,6 +368,7 @@ __global__ __launch_bounds__(kThreads) void epilogue_kernel(EpilogueArgs a) {
 template <int C, int CA, bool ADD>
 void launch_epilogue(cudaStream_t stream, const EpilogueArgs& a) {
     const dim3 grid((a.M + kEpiRows - 1) / kEpiRows);
+    smem_opt_in(epilogue_kernel<C, CA, ADD>, epilogue_smem<C, CA>());
     epilogue_kernel<C, CA, ADD><<<grid, kThreads, epilogue_smem<C, CA>(), stream>>>(a);
 }
 

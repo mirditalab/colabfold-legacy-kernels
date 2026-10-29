@@ -9,6 +9,13 @@
 
 enum class GdpAct { kSigmoid, kSwish };
 
+// A launch's dynamic shared memory past the default 48 KB needs the kernel opted in (wide pairs).
+template <typename Kernel> void smem_opt_in(Kernel* kernel, size_t bytes) {
+    if (bytes > 48 * 1024) {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes);
+    }
+}
+
 template <GdpAct A>
 __device__ __forceinline__ float gdp_act(float g) {
     // ftz exp and approximate divide: MUFU.EX2 + MUFU.RCP, no denormal fixup, no IEEE divide subroutine
