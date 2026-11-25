@@ -263,6 +263,7 @@ __global__ __launch_bounds__(BQ / FRAG * WARP, 2) void volta_wmma_kernel(
         }
         l_part += __shfl_xor_sync(0xffffffffu, l_part, 1);
         const float alpha = raise ? ex2_ftz(m_prev - m_cur) : 1.f;
+        __syncwarp(); // the other lane read ms[r_blk]; shuffles order execution, not memory
         if (half_id == 0) {
             ms[r_blk] = m_cur;
             ls[r_blk] = ls[r_blk] * alpha + l_part;
